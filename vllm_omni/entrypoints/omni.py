@@ -21,6 +21,8 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
+    from vllm.lora.request import LoRARequest
+
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -63,6 +65,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[True],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]: ...
 
     @overload
@@ -73,6 +76,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[False] = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
     ) -> list[OmniRequestOutput]: ...
 
     def generate(
@@ -82,6 +86,7 @@ class Omni(OmniBase):
         *,
         py_generator: bool = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         # Expand sampling params for PD disaggregation (user may provide N-1 params)
         if (
@@ -93,8 +98,10 @@ class Omni(OmniBase):
         sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
         try:
             if py_generator:
-                return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
-            return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+                return self._run_generation_with_generator(
+                    prompts, sampling_params_list, use_tqdm, lora_request=lora_request
+                )
+            return list(self._run_generation(prompts, sampling_params_list, use_tqdm, lora_request=lora_request))
         except Exception as e:
             logger.exception("[Omni] Failed to run generation: %s", e)
             self.close()
@@ -105,11 +112,13 @@ class Omni(OmniBase):
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
         yield from self._run_generation(
             prompts,
             sampling_params_list,
             use_tqdm,
+            lora_request=lora_request,
         )
 
     def _run_generation(
@@ -117,6 +126,7 @@ class Omni(OmniBase):
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
             sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
@@ -163,6 +173,7 @@ class Omni(OmniBase):
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
                     final_output_stage_ids=final_output_stage_ids,
+                    lora_request=lora_request,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts

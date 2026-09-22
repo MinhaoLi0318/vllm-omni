@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -143,6 +144,7 @@ class FakeAsyncOmniEngine:
         sampling_params_list: list[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         **kwargs: Any,
     ) -> None:
         msg = {
@@ -151,6 +153,7 @@ class FakeAsyncOmniEngine:
             "sampling_params_list": sampling_params_list,
             "final_stage_id": final_stage_id,
             "arrival_time": arrival_time,
+            "lora_request": lora_request,
         }
         self.submitted.append(msg)
         if self.on_add_request is not None:
@@ -887,6 +890,47 @@ def test_omni_generate_returns_list_when_not_using_generator(monkeypatch: pytest
     assert isinstance(outputs, list)
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 2, 0, 2]
+
+
+@pytest.mark.parametrize("py_generator", [False, True])
+def test_omni_generate_forwards_lora_request_to_engine(monkeypatch: pytest.MonkeyPatch, py_generator: bool):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    lora_request = LoRARequest(lora_name="a", lora_int_id=1, lora_path="/tmp/a")
+
+    app = Omni("dummy-model")
+    try:
+        outputs = list(app.generate(["p1", "p2"], py_generator=py_generator, use_tqdm=False, lora_request=lora_request))
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 4
+    assert len(engine.submitted) == 2
+    assert all(msg["lora_request"] is lora_request for msg in engine.submitted)
+
+
+def test_omni_generate_defaults_lora_request_to_none(monkeypatch: pytest.MonkeyPatch):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        app.generate(["p1"], use_tqdm=False)
+    finally:
+        app.shutdown()
+
+    assert len(engine.submitted) == 1
+    assert engine.submitted[0]["lora_request"] is None
 
 
 def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatch: pytest.MonkeyPatch):
