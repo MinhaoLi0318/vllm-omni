@@ -1057,16 +1057,16 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:
-        """Run one phase of the oldest queued prefetch; return whether it did work.
+        """Run one phase of the lone queued prefetch; return whether it did work.
 
         Called by the runner only on a zero-token step that follows another,
         on the same thread as ``forward``: the cold reference work runs through
         the same calls chunk 0 makes, so chunk 0 runs its normal inline path
         and simply hits the warm caches. Phase A (materialize + prepare_prompt)
-        runs only while no stream is live here and a pin is free; by default it
-        then retires the record and chunk 0 runs setup_batch inline. Only with
-        ``token2wav_ref_prefetch_setup`` does a later call run phase B
-        (setup_batch).
+        runs only while no stream is live here, no other reference is queued
+        and a pin is free; by default it then retires the record and chunk 0
+        runs setup_batch inline. Only with ``token2wav_ref_prefetch_setup``
+        does a later call run phase B (setup_batch).
         """
         if not self._ref_prefetch_enabled or self.backend is None or not self._prefetch_queue:
             return False
@@ -1077,6 +1077,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         # a long-lived (e.g. duplex) session keeps state here. Records stay
         # queued; their own chunk 0 or finish still drops them as usual.
         if self._states:
+            return False
+        # Lone-waiter gate: start no phase while more than one reference is
+        # queued. Several waiting placeholders (e.g. the initial burst at
+        # C > 1) mean their thinker and talker work is starting on the stages
+        # that share this GPU, and a phase would compete with it. This keeps
+        # the prefetch to a lone request at low concurrency; the queued
+        # records are dropped by their own chunk 0 or finish as usual.
+        if len(self._prefetch_queue) > 1:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
         entry = record.entry

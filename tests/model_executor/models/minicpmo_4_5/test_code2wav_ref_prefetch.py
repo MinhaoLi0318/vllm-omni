@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Idle-step reference prefetch for the MiniCPM-o 4.5 Code2Wav stage.
 
-``on_requests_added`` queues a placeholder's reference, and each
-``run_idle_prefetch`` call runs one phase of the oldest record: phase A
-materializes and pins the WAV and runs ``prepare_prompt``; phase B
-(``token2wav_ref_prefetch_setup`` only) runs ``setup_batch``. Chunk 0's own
-path is unchanged: it hits the warm caches and must stay bit-exact.
+``on_requests_added`` queues a placeholder's reference, and a
+``run_idle_prefetch`` call runs one phase of it only while it is the lone
+queued record and no stream is live: phase A materializes and pins the WAV and
+runs ``prepare_prompt``; phase B (``token2wav_ref_prefetch_setup`` only) runs
+``setup_batch``. Chunk 0's own path is unchanged: it hits the warm caches and
+must stay bit-exact.
 """
 
 from __future__ import annotations
@@ -176,27 +177,38 @@ def test_prefetch_warms_the_caches_and_chunk0_is_bit_exact(prefetch_setup, initi
     assert Path(entry.path).exists() == bool(capacity)
 
 
-# (did work, queue after the call) for each idle call over records a, b, c.
-_FIFO_STEPS = {
-    "default": [(True, "bc"), (True, "c"), (True, ""), (False, "")],
-    # Phase A leaves the record at the head and phase B pops it. b and c find
-    # the setup slot held by a, so their phase B does no work.
-    "with-setup": [(True, "abc"), (True, "bc"), (True, "bc"), (False, "c"), (True, "c"), (False, ""), (False, "")],
+# (did work, queue after the call) for three idle calls after each of a, b, c
+# arrives alone; the earlier ones keep their pins, their chunk 0 still pending.
+_LONE_STEPS = {
+    "default": [[(True, ""), (False, ""), (False, "")]] * 3,
+    # Phase A leaves the record queued and phase B pops it. b and c find the
+    # setup slot held by a, so their phase B does no work.
+    "with-setup": [
+        [(True, "a"), (True, ""), (False, "")],
+        [(True, "b"), (False, ""), (False, "")],
+        [(True, "c"), (False, ""), (False, "")],
+    ],
     # No setup cache means no slot to warm: every phase B is a no-op.
-    "no-setup-cache": [(True, "abc"), (False, "bc"), (True, "bc"), (False, "c"), (True, "c"), (False, ""), (False, "")],
+    "no-setup-cache": [
+        [(True, "a"), (False, ""), (False, "")],
+        [(True, "b"), (False, ""), (False, "")],
+        [(True, "c"), (False, ""), (False, "")],
+    ],
 }
 
 
-@pytest.mark.parametrize("case", list(_FIFO_STEPS))
-def test_idle_prefetch_runs_one_phase_per_call_in_fifo_order(case):
+@pytest.mark.parametrize("case", list(_LONE_STEPS))
+def test_idle_prefetch_runs_one_phase_per_call_for_requests_arriving_one_at_a_time(case):
     setup_cache_size = 0 if case == "no-setup-cache" else 1
     model, token2wav = _prefetch_model(setup_cache_size=setup_cache_size, prefetch_setup=case != "default")
     assert model.run_idle_prefetch() is False  # nothing queued
-    model.on_requests_added([_prewarm("a", _REF_A), _prewarm("b", _REF_B), _prewarm("c", _REF_C)])
 
-    steps = [(model.run_idle_prefetch(), "".join(model._prefetch_queue)) for _ in _FIFO_STEPS[case]]
+    steps = []
+    for request_id, reference in zip("abc", (_REF_A, _REF_B, _REF_C), strict=True):
+        model.on_requests_added([_prewarm(request_id, reference)])
+        steps.append([(model.run_idle_prefetch(), "".join(model._prefetch_queue)) for _ in range(3)])
 
-    assert steps == _FIFO_STEPS[case]
+    assert steps == _LONE_STEPS[case]
     warmed_setup = case == "with-setup"
     assert _cold(token2wav) == (3, int(warmed_setup))
     assert model._prefetch_setup_holder == ("a" if warmed_setup else None)
@@ -249,6 +261,62 @@ def test_busy_gate_defers_each_phase_while_another_stream_is_live(prefetch_setup
         assert model._prefetch_setup_holder == "req-a"
 
     model.on_requests_finished(["req-live", "req-a"])
+    _assert_no_prefetch_state(model)
+
+
+@pytest.mark.parametrize("drop", ["chunk0", "abort"])
+@pytest.mark.parametrize(
+    "prefetch_setup,deferred_phase", [(False, "A"), (True, "B")], ids=["default-phase-a", "setup-phase-b"]
+)
+def test_lone_waiter_gate_defers_each_phase_while_several_references_are_queued(prefetch_setup, deferred_phase, drop):
+    """No phase starts while two or more references wait: a burst of
+    placeholders means their upstream work is starting on the shared GPU."""
+    model, token2wav = _prefetch_model(prefetch_setup=prefetch_setup)
+    model.on_requests_added([_prewarm("req-a", _REF_A)])
+    if deferred_phase == "B":
+        assert model.run_idle_prefetch() is True  # phase A while alone
+    model.on_requests_added([_prewarm("req-b", _REF_B), _prewarm("req-c", _REF_C)])
+    cold = _cold(token2wav)
+    pins = dict(model._prefetch_pins)
+
+    assert [model.run_idle_prefetch() for _ in range(3)] == [False] * 3
+    assert _cold(token2wav) == cold
+    assert list(model._prefetch_queue) == ["req-a", "req-b", "req-c"]
+    assert model._prefetch_pins == pins
+    assert model._prefetch_setup_holder is None
+
+    # The others leave. req-b's own chunk 0 runs the cold path inline,
+    # bit-exact, and keeps no prefetch state; or req-b is aborted.
+    if drop == "chunk0":
+        baseline, _ = _prefetch_model(ref_prefetch=False)
+        _assert_bit_exact(model, baseline, lambda: _chunk0(_REF_B), "req-b")
+        assert _cold(token2wav) == (cold[0] + 1, cold[1] + 1)
+        assert model._runtime_prompts[model._request_prompt_keys["req-b"]].owners == {"req-b"}
+    else:
+        model.on_requests_finished(["req-b"])
+        # Exactly two still queued and no stream live: the gate alone holds them.
+        assert list(model._prefetch_queue) == ["req-a", "req-c"]
+        assert model.run_idle_prefetch() is False
+        assert _cold(token2wav) == cold
+    model.on_requests_finished(["req-c"])
+    assert list(model._prefetch_queue) == ["req-a"]
+    assert model._prefetch_pins == pins
+    if drop == "chunk0":
+        # The lone record still waits while req-b streams (busy gate).
+        assert model.run_idle_prefetch() is False
+        model.on_requests_finished(["req-b"])
+
+    # Now alone with no live stream, req-a's deferred phase runs.
+    cold = _cold(token2wav)
+    assert model.run_idle_prefetch() is True
+    if deferred_phase == "A":
+        assert _cold(token2wav) == (cold[0] + 1, cold[1])
+        assert list(model._prefetch_pins) == ["req-a"]
+    else:
+        assert _cold(token2wav) == (cold[0], cold[1] + 1)
+        assert model._prefetch_setup_holder == "req-a"
+
+    model.on_requests_finished(["req-a"])
     _assert_no_prefetch_state(model)
 
 
@@ -375,9 +443,12 @@ def test_prefetch_pin_survives_placeholder_steps_and_trims_by_other_requests(pre
 def test_requests_sharing_a_reference_hold_separate_pins(prefetch_setup):
     # Two outstanding pins need a runtime-prompt capacity (the pin cap) of 2.
     model, token2wav = _prefetch_model(capacity=2, prefetch_setup=prefetch_setup)
-    model.on_requests_added([_prewarm("req-a", _REF_A), _prewarm("req-b", _REF_A)])
-    for _ in range(4):
-        model.run_idle_prefetch()
+    phases = []
+    for request_id in ("req-a", "req-b"):  # each arrives alone
+        model.on_requests_added([_prewarm(request_id, _REF_A)])
+        phases += [model.run_idle_prefetch() for _ in range(2)]
+    # req-b's phase B (with-setup) finds the setup slot held by req-a.
+    assert phases == [True, prefetch_setup, True, False]
     assert not model._prefetch_queue
     key = model._prefetch_pins["req-a"]
     entry = model._runtime_prompts[key]
@@ -440,8 +511,10 @@ def test_setup_slot_holds_one_waiting_setup_until_chunk0_or_eviction():
     evicted the holder's from the one-entry setup cache."""
     model, token2wav = _prefetch_model(prefetch_setup=True)
     baseline, _ = _prefetch_model(ref_prefetch=False)
-    model.on_requests_added([_prewarm("req-a", _REF_A), _prewarm("req-b", _REF_B)])
-    assert [model.run_idle_prefetch() for _ in range(5)] == [True, True, True, False, False]
+    model.on_requests_added([_prewarm("req-a", _REF_A)])
+    assert [model.run_idle_prefetch() for _ in range(2)] == [True, True]
+    model.on_requests_added([_prewarm("req-b", _REF_B)])  # arrives alone
+    assert [model.run_idle_prefetch() for _ in range(3)] == [True, False, False]
     assert model._prefetch_setup_holder == "req-a"
     entry_b = model._runtime_prompts[model._prefetch_pins["req-b"]]
     assert _cold(token2wav) == (2, 1)  # req-b got its prompt but no setup
@@ -487,15 +560,17 @@ def test_setup_slot_holds_one_waiting_setup_until_chunk0_or_eviction():
 @pytest.mark.parametrize("capacity", [0, 2])
 def test_outstanding_pins_are_capped_by_the_runtime_prompt_capacity(capacity):
     """Pinned entries are never trimmed, so phase A waits while
-    ``max(1, capacity)`` requests hold pins; the record stays queued."""
+    ``max(1, capacity)`` requests hold pins; the record stays queued. Pins pile
+    up when requests arrive one at a time ahead of their chunk 0."""
     model, token2wav = _prefetch_model(capacity=capacity)
     cap = max(1, capacity)
     request_ids = [f"req-{index}" for index in range(cap + 1)]
-    model.on_requests_added(
-        [_prewarm(request_id, torch.tensor([0.0, 0.1 * (index + 1)])) for index, request_id in enumerate(request_ids)]
-    )
+    started = []
+    for index, request_id in enumerate(request_ids):
+        model.on_requests_added([_prewarm(request_id, torch.tensor([0.0, 0.1 * (index + 1)]))])
+        started.append(model.run_idle_prefetch())
 
-    assert [model.run_idle_prefetch() for _ in range(cap + 2)] == [True] * cap + [False, False]
+    assert started + [model.run_idle_prefetch()] == [True] * cap + [False, False]
     assert set(model._prefetch_pins) == set(request_ids[:cap])
     assert list(model._prefetch_queue) == [request_ids[cap]]
     assert token2wav.prompt_calls == cap
@@ -518,6 +593,7 @@ def test_prefetch_queue_is_capped_and_overflow_runs_inline_at_chunk0():
 
     model.on_requests_added([_prewarm(request_id) for request_id in request_ids])
     assert list(model._prefetch_queue) == request_ids[:limit]
+    assert model.run_idle_prefetch() is False  # no lone waiter: records wait
 
     # The skipped request prepares its reference inline at chunk 0.
     _forward(model, [_chunk0(_REF_A)], request_ids=[overflow])
