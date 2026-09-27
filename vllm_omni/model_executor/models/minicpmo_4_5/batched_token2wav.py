@@ -940,16 +940,23 @@ class BatchedToken2Wav(nn.Module):
             for row in split
         ]
 
-    def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
-        """Reuse read-only prompt conditioning for the same shape and padding."""
+    def _setup_cache_key(self, features: PromptFeatures, batch_size: int) -> tuple[tuple[str, str], int, int]:
         bucket_frames = (
             self._cfm_graph_bucket_frames
             if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
             else 0
         )
+        return (features.cache_key, batch_size, bucket_frames)
+
+    def has_cached_setup(self, features: PromptFeatures, batch_size: int) -> bool:
+        """Whether :meth:`setup_batch` would hit its cache now; read-only."""
+        return self._setup_cache_key(features, batch_size) in self._setup_cache
+
+    def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
+        """Reuse read-only prompt conditioning for the same shape and padding."""
         # Capture the policy before setup: graph capture may disable the wrapper
         # after padding has already been chosen for these initial states.
-        cache_key = (features.cache_key, batch_size, bucket_frames)
+        cache_key = self._setup_cache_key(features, batch_size)
         cached = self._setup_cache.get(cache_key)
         if cached is not None:
             self._setup_cache.move_to_end(cache_key)

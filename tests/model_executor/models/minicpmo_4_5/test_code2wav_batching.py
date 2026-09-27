@@ -226,6 +226,24 @@ def test_setup_cache_keys_batch_size_and_evicts_least_recent_entry():
     assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
 
 
+def test_has_cached_setup_probes_the_setup_batch_key_read_only():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
+    first = adapter.prepare_prompt("first", "/fake/first.wav")
+    second = adapter.prepare_prompt("second", "/fake/second.wav")
+
+    assert not adapter.has_cached_setup(first, 1)
+    adapter.setup_batch(first, 1)
+    assert adapter.has_cached_setup(first, 1)
+    assert not adapter.has_cached_setup(first, 2)
+    assert not adapter.has_cached_setup(second, 1)
+    assert token2wav.flow.encoder.calls == [1]
+
+    adapter.setup_batch(second, 1)
+    assert not adapter.has_cached_setup(first, 1)
+    assert adapter.has_cached_setup(second, 1)
+
+
 def test_evict_prompt_clears_features_and_setup_state():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav, setup_cache_size=2)
@@ -1622,9 +1640,13 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
         padded = adapter.setup_batch(prompt, 1)
         assert padded[0].flow_cache["estimator_att_cache"].shape[4] == 304
         padded_keys = list(adapter._setup_cache)
+        # has_cached_setup agrees with setup_batch's key, padding included.
+        assert adapter.has_cached_setup(prompt, 1) is not disable_during_setup
 
         wrapper.enabled = False
+        assert not adapter.has_cached_setup(prompt, 1)
         unpadded = adapter.setup_batch(prompt, 1)
+        assert adapter.has_cached_setup(prompt, 1)
         reused = adapter.setup_batch(prompt, 1)
 
     assert unpadded[0].flow_cache["estimator_att_cache"].shape[4] == 300
