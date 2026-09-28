@@ -9,7 +9,7 @@ import os
 import tempfile
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
@@ -201,7 +201,14 @@ class _RequestState:
 class _RuntimePrompt:
     cache_id: str
     path: str
+    # Request ids whose committed chunk-0 reference is this entry.
     owners: set[str]
+    # Request ids whose idle-step prefetch pins this entry until their chunk 0
+    # or finish. Kept apart from ``owners``: chunk 0 commits and releases
+    # ownership only through ``_request_prompt_keys``, so a chunk-0 reference
+    # that differs from the prefetched one must not leave the prefetched entry
+    # owned by the request forever, and no request id can collide with a pin.
+    pins: set[str] = field(default_factory=set)
 
 
 # Placeholders queued for an idle-step prefetch at once; beyond this a request
@@ -216,14 +223,6 @@ class _RefPrefetch:
     # Set once phase A (materialize + prepare_prompt) has run; the record then
     # stays queued only for phase B (``token2wav_ref_prefetch_setup``).
     entry: _RuntimePrompt | None = None
-
-
-def _prefetch_owner(state_id: str) -> str:
-    # A distinct owner token rather than the bare request id: chunk 0 commits
-    # and releases ownership only through ``_request_prompt_keys``, so a chunk-0
-    # reference that differs from the prefetched one must not leave the
-    # prefetched entry owned by the request forever.
-    return f"prefetch:{state_id}"
 
 
 @dataclass(frozen=True)
@@ -515,7 +514,10 @@ class MiniCPMO45Code2Wav(nn.Module):
     def _trim_runtime_prompts(self) -> None:
         """Evict least-recent unowned references, never request-owned or prefetch-pinned state."""
         while len(self._runtime_prompts) > self._runtime_prompt_cache_size:
-            victim = next(((key, entry) for key, entry in self._runtime_prompts.items() if not entry.owners), None)
+            victim = next(
+                ((key, entry) for key, entry in self._runtime_prompts.items() if not entry.owners and not entry.pins),
+                None,
+            )
             if victim is None:
                 return
             self._evict_runtime_prompt(*victim)
@@ -1099,7 +1101,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
                 cache_key, entry = self._materialize_runtime_prompt(record.ref_audio, record.sample_rate)
-                entry.owners.add(_prefetch_owner(state_id))
+                entry.pins.add(state_id)
                 self._prefetch_pins[state_id] = cache_key
                 self._trim_runtime_prompts()
                 self.backend.prepare_prompt(entry.cache_id, entry.path)
@@ -1158,7 +1160,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             return
         entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
         if entry is not None:
-            entry.owners.discard(_prefetch_owner(state_id))
+            entry.pins.discard(state_id)
         self._trim_runtime_prompts()
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:

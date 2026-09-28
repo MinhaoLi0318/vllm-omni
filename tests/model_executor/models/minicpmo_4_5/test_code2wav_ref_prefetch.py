@@ -29,10 +29,7 @@ from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
 )
 from vllm_omni.core.sched.output import OmniRequestPrewarm
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
-    MiniCPMO45Code2Wav,
-    _prefetch_owner,
-)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -116,8 +113,7 @@ def _assert_no_prefetch_state(model: MiniCPMO45Code2Wav) -> None:
     assert not model._prefetch_pins
     assert model._prefetch_setup_holder is None
     assert model._prefetch_setup_features is None
-    prefix = _prefetch_owner("")
-    assert not any(owner.startswith(prefix) for entry in model._runtime_prompts.values() for owner in entry.owners)
+    assert not any(entry.pins for entry in model._runtime_prompts.values())
 
 
 def _assert_bit_exact(model, baseline, make_info, request_id: str = "req-a") -> None:
@@ -149,7 +145,7 @@ def test_prefetch_warms_the_caches_and_chunk0_is_bit_exact(prefetch_setup, initi
     key = model._prefetch_pins["req-a"]
     entry = model._runtime_prompts[key]
     prompt = (entry.cache_id, entry.path)
-    assert entry.owners == {_prefetch_owner("req-a")}
+    assert (entry.owners, entry.pins) == (set(), {"req-a"})
     assert Path(entry.path).is_file()
     assert _cold(token2wav) == (1, 0)
     # The prefetch never claims request ownership or state; only chunk 0 does.
@@ -346,7 +342,7 @@ def test_chunk0_that_overtakes_the_prefetch_retires_it_without_duplicate_work(ph
 
 @pytest.mark.parametrize("prefetch_setup", [False, True], ids=["default", "with-setup"])
 def test_mismatched_chunk0_reference_runs_inline_and_releases_the_prefetch_pin(prefetch_setup):
-    # Capacity 0: the released entry has no owner left and is evicted.
+    # Capacity 0: the released entry has no owner or pin left and is evicted.
     model, token2wav = _prefetch_model(capacity=0, prefetch_setup=prefetch_setup)
     baseline, _ = _prefetch_model(capacity=0, ref_prefetch=False)
     model.on_requests_added([_prewarm("req-a", _REF_A)])
@@ -422,7 +418,7 @@ def test_prefetch_pin_survives_placeholder_steps_and_trims_by_other_requests(pre
 
     assert list(model._runtime_prompts) == [key]
     assert model._prefetch_pins == {"req-a": key}
-    assert entry.owners == {_prefetch_owner("req-a")}
+    assert (entry.owners, entry.pins) == (set(), {"req-a"})
     assert Path(entry.path).is_file()
     assert not path_b.exists()
 
@@ -453,15 +449,15 @@ def test_requests_sharing_a_reference_hold_separate_pins(prefetch_setup):
     key = model._prefetch_pins["req-a"]
     entry = model._runtime_prompts[key]
     assert model._prefetch_pins == {"req-a": key, "req-b": key}
-    assert entry.owners == {_prefetch_owner("req-a"), _prefetch_owner("req-b")}
+    assert (entry.owners, entry.pins) == (set(), {"req-a", "req-b"})
     assert _cold(token2wav) == (1, int(prefetch_setup))
 
     # Aborting one keeps the entry for the other, even with the cache squeezed
-    # to zero so that only owners keep entries.
+    # to zero so that only owners and pins keep entries.
     model._runtime_prompt_cache_size = 0
     model.on_requests_finished(["req-a"])
     assert model._runtime_prompts[key] is entry
-    assert entry.owners == {_prefetch_owner("req-b")}
+    assert (entry.owners, entry.pins) == (set(), {"req-b"})
     assert Path(entry.path).is_file()
 
     # req-b hits the shared prompt, and the setup too when it was prefetched.
@@ -469,6 +465,60 @@ def test_requests_sharing_a_reference_hold_separate_pins(prefetch_setup):
     assert _cold(token2wav) == (1, 1)
     assert entry.owners == {"req-b"}
     _assert_no_prefetch_state(model)
+
+
+@pytest.mark.parametrize("request_id", ["prefetch:foo", "bar"], ids=["pin-like-id", "plain-id"])
+def test_releasing_a_pin_keeps_the_reference_of_a_request_whose_id_looks_like_the_pin(request_id):
+    """Pins are kept apart from request ownership, so no request id, however
+    it is spelled, can alias another request's pin: releasing foo's pin must
+    not strip ``request_id``'s ownership and let a trim evict its reference."""
+    # Capacity 1: the next new reference trims every entry nothing holds.
+    model, _ = _prefetch_model(capacity=1)
+    model.on_requests_added([_prewarm("foo", _REF_A)])
+    assert [model.run_idle_prefetch() for _ in range(2)] == [True, False]  # phase A
+    key = model._prefetch_pins["foo"]
+    entry = model._runtime_prompts[key]
+
+    # request_id's chunk 0 commits the same reference while foo's pin holds it.
+    _forward(model, [_chunk0(_REF_A)], request_ids=[request_id])
+    assert model._request_prompt_keys[request_id] == key
+    assert request_id in entry.owners
+    assert model._prefetch_pins == {"foo": key}
+
+    # foo is aborted before its chunk 0, releasing its pin; then a third
+    # request's new reference pushes the cache over capacity and trims.
+    model.on_requests_finished(["foo"])
+    _forward(model, [_chunk0(_REF_B)], request_ids=["baz"])
+
+    # The trim spares the entry: still cached, its WAV on disk, and owned by
+    # the request that is still streaming from it.
+    assert model._runtime_prompts.get(key) is entry
+    assert Path(entry.path).is_file()
+    assert set(model._runtime_prompts) == {key, model._request_prompt_keys["baz"]}
+    assert request_id in model._states
+    assert model._request_prompt_keys[request_id] == key
+    assert entry.owners == {request_id}
+    # foo's pin is gone, from the index and from the entry.
+    assert model._prefetch_pins == {}
+    assert entry.pins == set()
+
+
+def test_finishing_a_request_whose_id_looks_like_a_pin_keeps_that_pin():
+    """The reverse aliasing: a request named like foo's pin finishing must not
+    release foo's pin, or a capacity-0 trim evicts foo's prefetched entry."""
+    model, _ = _prefetch_model(capacity=0)
+    model.on_requests_added([_prewarm("foo", _REF_A)])
+    assert [model.run_idle_prefetch() for _ in range(2)] == [True, False]  # phase A
+    key = model._prefetch_pins["foo"]
+    entry = model._runtime_prompts[key]
+
+    _forward(model, [_chunk0(_REF_A)], request_ids=["prefetch:foo"])
+    model.on_requests_finished(["prefetch:foo"])
+
+    assert model._runtime_prompts.get(key) is entry
+    assert Path(entry.path).is_file()
+    assert (entry.owners, entry.pins) == (set(), {"foo"})
+    assert model._prefetch_pins == {"foo": key}
 
 
 @pytest.mark.parametrize("capacity", [0, 4])
