@@ -586,7 +586,7 @@ def test_setup_slot_holds_one_waiting_setup_until_chunk0_or_eviction():
     model.on_requests_finished(["req-b"])
     assert _cold(token2wav) == (3, 3)
     assert token2wav.cold_setups[-1] == (entry_b.cache_id, entry_b.path)
-    assert not model.backend.has_cached_setup(features_c, 1)
+    assert not model.backend.has_cached_setup(features_c)
     assert model._prefetch_setup_holder == "req-c"
 
     # So the next placeholder's phase B takes over the stale slot...
