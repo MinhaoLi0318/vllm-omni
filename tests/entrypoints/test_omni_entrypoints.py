@@ -914,6 +914,89 @@ def test_omni_generate_forwards_lora_request_to_engine(monkeypatch: pytest.Monke
     assert all(msg["lora_request"] is lora_request for msg in engine.submitted)
 
 
+@pytest.mark.parametrize("py_generator", [False, True])
+def test_omni_generate_maps_lora_request_sequence_per_prompt(monkeypatch: pytest.MonkeyPatch, py_generator: bool):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    lora_a = LoRARequest(lora_name="a", lora_int_id=1, lora_path="/tmp/a")
+    lora_b = LoRARequest(lora_name="b", lora_int_id=2, lora_path="/tmp/b")
+
+    app = Omni("dummy-model")
+    try:
+        outputs = list(
+            app.generate(
+                ["p1", "p2", "p3"],
+                py_generator=py_generator,
+                use_tqdm=False,
+                lora_request=[lora_a, None, lora_b],
+            )
+        )
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 6
+    # The i-th prompt uses the i-th LoRA request.
+    assert [(msg["prompt"], msg["lora_request"]) for msg in engine.submitted] == [
+        ("p1", lora_a),
+        ("p2", None),
+        ("p3", lora_b),
+    ]
+
+
+@pytest.mark.parametrize("py_generator", [False, True])
+def test_omni_generate_rejects_lora_request_sequence_of_wrong_length(
+    monkeypatch: pytest.MonkeyPatch, py_generator: bool
+):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    lora_a = LoRARequest(lora_name="a", lora_int_id=1, lora_path="/tmp/a")
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match=r"prompts \(2\) and lora_request \(1\)"):
+            app.generate(["p1", "p2"], py_generator=py_generator, use_tqdm=False, lora_request=[lora_a])
+        # Rejected before any request is submitted, and the engine stays up.
+        assert engine.submitted == []
+        assert not engine.shutdown_called
+    finally:
+        app.shutdown()
+
+
+@pytest.mark.parametrize("pipeline", ["diffusion-stage0", "pd-disaggregation"])
+def test_omni_generate_rejects_lora_request_that_would_be_dropped(monkeypatch: pytest.MonkeyPatch, pipeline: str):
+    stage_metadata = DIFFUSION_ONLY_META if pipeline == "diffusion-stage0" else THREE_STAGE_META
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=stage_metadata,
+        default_sampling_params_list=[SamplingParams(max_tokens=8) for _ in stage_metadata],
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    lora_a = LoRARequest(lora_name="a", lora_int_id=1, lora_path="/tmp/a")
+
+    app = Omni("dummy-model")
+    if pipeline == "pd-disaggregation":
+        app._pd_separation_pair = (0, 1)
+    try:
+        match = "OmniDiffusionSamplingParams" if pipeline == "diffusion-stage0" else "prefill-decode"
+        with pytest.raises(ValueError, match=match):
+            app.generate(["p1", "p2"], use_tqdm=False, lora_request=[None, lora_a])
+        # Rejected before any request is submitted, and the engine stays up.
+        assert engine.submitted == []
+        assert not engine.shutdown_called
+    finally:
+        app.shutdown()
+
+
 def test_omni_generate_defaults_lora_request_to_none(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(
