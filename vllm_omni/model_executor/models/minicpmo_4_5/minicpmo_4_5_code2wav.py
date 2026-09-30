@@ -1079,7 +1079,10 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:
-        """Run one phase of the lone queued prefetch; return whether it did work.
+        """Run one phase of the lone queued prefetch.
+
+        Returns whether a phase ran. The runner ignores the result; callers
+        such as the unit tests use it to see which phase ran.
 
         Called by the runner only on a zero-token step that follows another,
         on the same thread as ``forward``: the cold reference work runs through
