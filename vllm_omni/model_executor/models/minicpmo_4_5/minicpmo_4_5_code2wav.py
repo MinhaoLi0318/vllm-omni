@@ -8,7 +8,8 @@ import json
 import os
 import tempfile
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from hashlib import sha256
@@ -776,12 +777,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        # This stage owns the vocoder process. Restore its previous matmul
-        # policy after eager execution/capture; cuDNN's policy is independent.
-        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            if self._extra_config().get("token2wav_allow_tf32", False):
-                torch.backends.cuda.matmul.allow_tf32 = True
+        with self._matmul_policy():
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -790,6 +786,21 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_additional_information,
                 **kwargs,
             )
+
+    @contextmanager
+    def _matmul_policy(self) -> Iterator[None]:
+        """Apply this stage's TF32 matmul policy for the enclosed work.
+
+        This stage owns the vocoder process. Restore its previous matmul
+        policy after eager execution/capture; cuDNN's policy is independent.
+        The idle prefetch runs the same preparation calls as chunk 0, so it
+        runs under the same policy.
+        """
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            yield
         finally:
             torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
@@ -1142,6 +1153,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > 1:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
+        with self._matmul_policy():
+            return self._run_prefetch_phase(state_id, record)
+
+    def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
+        """Run the next phase of ``record``; see ``run_idle_prefetch``."""
         entry = record.entry
         try:
             if entry is None:

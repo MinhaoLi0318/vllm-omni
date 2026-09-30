@@ -731,3 +731,30 @@ def test_bad_prefetch_payload_is_skipped_without_raising(payload, warns, mocker)
     assert [model.run_idle_prefetch() for _ in range(2)] == [True, False]
     assert set(model._prefetch_pins) == {"req-ok"}
     assert token2wav.prompt_calls == 1
+
+
+@pytest.mark.parametrize("allow_tf32", [False, True])
+def test_prefetch_phases_run_under_the_stage_matmul_policy(allow_tf32, monkeypatch):
+    # The prefetch runs chunk 0's preparation calls outside forward, so it must
+    # apply the same TF32 policy as forward and restore the caller's afterwards.
+    model, _ = _prefetch_model(prefetch_setup=True)
+    model.vllm_config.model_config.stage_connector_config["extra"]["token2wav_allow_tf32"] = allow_tf32
+    seen: list[tuple[str, bool]] = []
+    for name in ("prepare_prompt", "setup_batch"):
+        original = getattr(model.backend, name)
+
+        def recording(*args, _name=name, _original=original, **kwargs):
+            seen.append((_name, torch.backends.cuda.matmul.allow_tf32))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(model.backend, name, recording)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        model.on_requests_added([_prewarm("req-a")])
+        assert [model.run_idle_prefetch() for _ in range(3)] == [True, True, False]
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    # Phase A prepares the prompt; phase B prepares it again (cache hit) and builds the setup.
+    assert seen == [("prepare_prompt", allow_tf32), ("prepare_prompt", allow_tf32), ("setup_batch", allow_tf32)]
