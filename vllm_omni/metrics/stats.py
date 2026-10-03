@@ -69,6 +69,14 @@ class StageRequestStats:
     vllm_tpot_ms: float = 0.0
     vllm_itl_ms: float = 0.0
     vllm_itls_ms: list[float] | None = None
+    # Engine-core phase split of a finished vLLM request: queued -> scheduled
+    # -> first token -> last token, as in vLLM's FinishedRequestStats.
+    # None means not observed (diffusion stage, --log-stats off, or a missing
+    # engine-core event); 0 is a measured value.
+    vllm_queued_ms: float | None = None
+    vllm_prefill_ms: float | None = None
+    vllm_decode_ms: float | None = None
+    vllm_num_preemptions: int | None = None
 
     @property
     def rx_mbps(self) -> float:
