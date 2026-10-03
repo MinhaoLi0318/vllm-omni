@@ -276,7 +276,7 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 
 The separation follows upstream vLLM's pattern of `LoggingStatLogger` vs. `PrometheusStatLogger` — same underlying data, different consumption models.
 
-### AR-stage phase split in `StageRequestStats`
+### LLM-stage phase split in `StageRequestStats`
 
 With `--log-stats`, a stage served by a vLLM engine core (AR and generation stages) adds the engine-core phase split of the finished request to its `StageRequestStats` row:
 
@@ -287,9 +287,14 @@ With `--log-stats`, a stage served by a vLLM engine core (AR and generation stag
 | `vllm_decode_ms` | First output token to last output token |
 | `vllm_num_preemptions` | Number of `PREEMPTED` events |
 
-The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. They are the per-request values behind the wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels. No Prometheus family is added.
+The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. The one difference: upstream subtracts an unobserved timestamp as `0.0`, while these fields leave that interval out. No Prometheus family is added.
 
-`vllm_queued_ms` is the wait inside that stage's engine-core scheduler. It is separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+`vllm_queued_ms` runs from the stage's engine core accepting the request to its first scheduling. For stage 0 this is scheduler wait. A downstream stage can also wait there for its input:
+
+- With `async_chunk`, a downstream stage that receives chunks is submitted together with stage 0, and the request stays in `WAITING_FOR_CHUNK` until the first upstream chunk arrives. Later waits for the next chunk fall inside `vllm_decode_ms`.
+- A stage with `requires_full_payload_input` stays in `WAITING_FOR_INPUT` until the connector delivers the payload.
+
+For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
 
 The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `VLLM_LOGGING_LEVEL=DEBUG`); at `INFO` only the `[OmniTiming]` line is printed.
 
