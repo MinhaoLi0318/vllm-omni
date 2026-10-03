@@ -275,3 +275,20 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 `OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics` form the Prometheus-oriented path. They record aggregate counters, gauges, and histograms suitable for time-series monitoring and alerting. Both paths share the same source data (`StageRequestStats`, `TransferEdgeStats`) — `OrchestratorAggregator.record_transfer_tx/rx` in particular calls both the existing accumulator code and the Prometheus emit hook in the same method body. The two consumption models can run simultaneously without coupling.
 
 The separation follows upstream vLLM's pattern of `LoggingStatLogger` vs. `PrometheusStatLogger` — same underlying data, different consumption models.
+
+### AR-stage phase split in `StageRequestStats`
+
+With `--log-stats`, a stage served by a vLLM engine core (AR and generation stages) adds the engine-core phase split of the finished request to its `StageRequestStats` row:
+
+| Field | Interval |
+| ----- | -------- |
+| `vllm_queued_ms` | `QUEUED` event to first `SCHEDULED` event |
+| `vllm_prefill_ms` | First `SCHEDULED` event to first output token |
+| `vllm_decode_ms` | First output token to last output token |
+| `vllm_num_preemptions` | Number of `PREEMPTED` events |
+
+The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. They are the per-request values behind the wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels. No Prometheus family is added.
+
+Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
+
+For a streaming-input request, only the terminal event carries the split, and it covers the last input segment, because the request stats restart at each streaming update. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks.
