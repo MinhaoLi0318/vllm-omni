@@ -289,6 +289,10 @@ With `--log-stats`, a stage served by a vLLM engine core (AR and generation stag
 
 The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. They are the per-request values behind the wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels. No Prometheus family is added.
 
+`vllm_queued_ms` is the wait inside that stage's engine-core scheduler. It is separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+
+The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `VLLM_LOGGING_LEVEL=DEBUG`); at `INFO` only the `[OmniTiming]` line is printed.
+
 Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
 
 For a streaming-input request, only the terminal event carries the split, and it covers the last input segment, because the request stats restart at each streaming update. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks.
