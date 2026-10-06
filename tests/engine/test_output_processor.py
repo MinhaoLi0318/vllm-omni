@@ -998,10 +998,12 @@ def _stats_processor(state: OmniRequestState) -> MultimodalOutputProcessor:
     return processor
 
 
-def _stats_output(*, events=None, finish_reason=None, is_segment_finished=False) -> OmniEngineCoreOutput:
+def _stats_output(
+    *, events=None, finish_reason=None, is_segment_finished=False, new_token_ids=(10,)
+) -> OmniEngineCoreOutput:
     return OmniEngineCoreOutput(
         request_id="r",
-        new_token_ids=[10],
+        new_token_ids=list(new_token_ids),
         events=events,
         finish_reason=finish_reason,
         is_segment_finished=is_segment_finished,
@@ -1045,6 +1047,29 @@ def test_engine_core_events_reach_native_phase_split(make_state):
     assert record["vllm_prefill_ms"] == pytest.approx(finished.prefill_time * 1000.0)
     assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
     assert record["vllm_num_preemptions"] == finished.num_preemptions
+
+
+def test_one_shot_generation_phase_split_reports_whole_run_as_prefill():
+    # A generation stage that emits a single token-less output at stop: the
+    # first engine-core output sets the first-token timestamp, so the whole
+    # run is prefill and decode is a measured 0.
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    only = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ],
+        finish_reason=FinishReason.STOP,
+        new_token_ids=(),
+    )
+    processor.process_outputs([only], engine_core_timestamp=2.0, iteration_stats=IterationStats())
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 750.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0}
+    )
 
 
 def test_first_output_without_stats_leaves_prefill_and_decode_out():
