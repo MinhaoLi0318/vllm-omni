@@ -84,6 +84,8 @@ def _make_scheduler(scheduler_cls):
     scheduler.requests = {}
     scheduler.running = []
     scheduler.waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler._pending_request_prewarms = {}

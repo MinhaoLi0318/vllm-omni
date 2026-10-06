@@ -78,6 +78,23 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     return "tf32" if value else "off"
 
 
+@contextmanager
+def _stage_matmul_policy(extra: Mapping[str, Any]) -> Iterator[None]:
+    """Apply this stage's TF32 matmul policy for the enclosed work.
+
+    This stage owns the vocoder process. Restore its previous matmul
+    policy after eager execution/capture; cuDNN's policy is independent.
+    The idle prefetch runs the same preparation calls as chunk 0, so it
+    runs under the same policy.
+    """
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        if _tf32_mode(extra) != "off":
+            torch.backends.cuda.matmul.allow_tf32 = True
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
@@ -890,7 +907,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        with self._matmul_policy():
+        with _stage_matmul_policy(self._extra_config()):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -899,23 +916,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_additional_information,
                 **kwargs,
             )
-
-    @contextmanager
-    def _matmul_policy(self) -> Iterator[None]:
-        """Apply this stage's TF32 matmul policy for the enclosed work.
-
-        This stage owns the vocoder process. Restore its previous matmul
-        policy after eager execution/capture; cuDNN's policy is independent.
-        The idle prefetch runs the same preparation calls as chunk 0, so it
-        runs under the same policy.
-        """
-        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            if _tf32_mode(self._extra_config()) != "off":
-                torch.backends.cuda.matmul.allow_tf32 = True
-            yield
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
     @torch.inference_mode()
     def _forward_impl(
@@ -1297,7 +1297,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > 1:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
-        with self._matmul_policy():
+        with _stage_matmul_policy(self._extra_config()):
             return self._run_prefetch_phase(state_id, record)
 
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
