@@ -296,8 +296,13 @@ The intervals match upstream `FinishedRequestStats`, so time spent preempted sta
 
 For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
 
+Two more cases where an interval covers more than its name suggests:
+
+- A KV-transfer sender (a stage with `kv_transfer_criteria`) keeps the request running until the KV extraction is acknowledged, and the token-less `kv_ready` output it emits still advances the last-token timestamp. `vllm_decode_ms` therefore includes the wait for that acknowledgement.
+- `vllm_num_preemptions` counts `PREEMPTED` events. When the chunk transfer adapter moves running requests over `max_num_seqs` back to the waiting queue, it sets `PREEMPTED` without recording an event, so that wait is not counted as a preemption and stays inside prefill or decode.
+
 The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `VLLM_LOGGING_LEVEL=DEBUG`); at `INFO` only the `[OmniTiming]` line is printed.
 
 Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
 
-For a streaming-input request, only the terminal event carries the split, and it covers the last input segment, because the request stats restart at each streaming update. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks.
+For a streaming-input request, only the terminal event carries the split, and it covers the last input segment, because the request stats restart at each streaming update. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks. The duplex per-response table leaves them out (`DUPLEX_STAGE_TABLE_EXCLUDE`): they describe one engine-core request, not a response turn.
