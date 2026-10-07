@@ -396,6 +396,11 @@ _DIFFUSION_MODELS = {
         "pipeline_krea2",
         "Krea2Pipeline",
     ),
+    "Kandinsky6TI2VAPipeline": (
+        "kandinsky6",
+        "pipeline_kandinsky6",
+        "Kandinsky6TI2VAPipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
@@ -710,6 +715,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -756,6 +762,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
 }
 
 
