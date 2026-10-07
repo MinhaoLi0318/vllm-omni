@@ -298,6 +298,8 @@ The first engine-core output ends prefill even when it carries no token. A gener
 
 For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
 
+These intervals can overlap with other timings of the same request: the upstream stage's run, the transfer times in `TransferEdgeStats` and `vllm_omni:transfer_tx_s` / `vllm_omni:transfer_rx_s`, and stage-to-stage handoff events. Do not add them together into an end-to-end breakdown of a request unless the intervals are known not to overlap and use the same clock.
+
 Two more cases where an interval covers more than its name suggests:
 
 - A KV-transfer sender (a stage with `kv_transfer_criteria`) keeps the request running until the KV extraction is acknowledged, and the token-less `kv_ready` output it emits still advances the last-token timestamp. `vllm_decode_ms` therefore includes the wait for that acknowledgement.
