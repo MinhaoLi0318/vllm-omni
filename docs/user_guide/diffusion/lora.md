@@ -90,8 +90,9 @@ stage, with the same semantics as vLLM's `LLM.generate`:
 - A sequence must have one entry per prompt (otherwise `ValueError`); the i-th
   entry is used for the i-th prompt, and `None` means no adapter for that prompt.
 
-The stage-0 engine must be started with LoRA enabled (for example
-`enable_lora`, `max_loras` and `max_lora_rank` in its engine args), as in vLLM.
+Stage 0 must be started with LoRA enabled, using stage-scoped keys (see
+[Stage Configs](../../configuration/stage_configs.md)). Otherwise
+`Omni.generate` raises `ValueError` before submitting anything.
 
 This argument is not forwarded to later stages or to CFG companion requests.
 Each diffusion stage uses the `lora_request` in its own
@@ -100,8 +101,13 @@ Each diffusion stage uses the `lora_request` in its own
 disaggregation is enabled (the decode stage would run without the adapter).
 
 ```python
+from vllm_omni import Omni
 from vllm_omni.lora.request import LoRARequest
 
+omni = Omni(
+    model="<model>",
+    stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 16, "max_loras": 2}},
+)
 lora_a = LoRARequest(lora_name="adapter_a", lora_int_id=1, lora_path="/path/to/adapter_a")
 lora_b = LoRARequest(lora_name="adapter_b", lora_int_id=2, lora_path="/path/to/adapter_b")
 

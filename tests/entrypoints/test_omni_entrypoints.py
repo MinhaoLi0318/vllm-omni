@@ -997,6 +997,34 @@ def test_omni_generate_rejects_lora_request_that_would_be_dropped(monkeypatch: p
         app.shutdown()
 
 
+@pytest.mark.parametrize("lora_enabled", [False, True], ids=["lora-disabled", "lora-enabled"])
+def test_omni_generate_checks_stage0_lora_config(monkeypatch: pytest.MonkeyPatch, lora_enabled: bool):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_omni_final_only_outputs,
+    )
+    lora_config = SimpleNamespace(max_lora_rank=16) if lora_enabled else None
+    engine.stage_vllm_configs[0] = SimpleNamespace(lora_config=lora_config)
+    _patch_engine(monkeypatch, engine)
+    lora_a = LoRARequest(lora_name="a", lora_int_id=1, lora_path="/tmp/a")
+
+    app = Omni("dummy-model")
+    try:
+        if lora_enabled:
+            app.generate(["p1"], use_tqdm=False, lora_request=lora_a)
+            assert engine.submitted[0]["lora_request"] is lora_a
+        else:
+            with pytest.raises(ValueError, match="enable_lora"):
+                app.generate(["p1"], use_tqdm=False, lora_request=lora_a)
+            # Rejected before any request is submitted, and the engine stays up.
+            assert engine.submitted == []
+            assert not engine.shutdown_called
+    finally:
+        app.shutdown()
+
+
 def test_omni_generate_defaults_lora_request_to_none(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(

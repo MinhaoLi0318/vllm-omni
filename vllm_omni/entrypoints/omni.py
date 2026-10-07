@@ -132,7 +132,8 @@ class Omni(OmniBase):
             ValueError: If a ``lora_request`` sequence does not match the
                 prompts in length, or a ``lora_request`` is given when stage 0
                 is a diffusion stage or when prefill-decode disaggregation is
-                enabled, where it would be silently dropped.
+                enabled, where it would be silently dropped, or when stage 0
+                was started without LoRA enabled.
         """
         # Validate before the try block, so a bad argument does not close the engine.
         lora_requests = _lora_request_to_seq(lora_request, len(_prompt_list(prompts)))
@@ -168,6 +169,12 @@ class Omni(OmniBase):
             raise ValueError(
                 "lora_request is not supported with prefill-decode disaggregation: "
                 "the decode stage would run without the adapter."
+            )
+        stage_vllm_configs = getattr(self.engine, "stage_vllm_configs", None) or [None]
+        if stage_vllm_configs[0] is not None and stage_vllm_configs[0].lora_config is None:
+            raise ValueError(
+                "lora_request needs LoRA enabled on stage 0, e.g. "
+                'Omni(model, stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 16}}).'
             )
 
     def _run_generation_with_generator(
