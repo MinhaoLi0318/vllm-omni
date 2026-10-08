@@ -51,10 +51,20 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
         "QwenImageLayeredPipeline",
+    ),
+    "QwenImage21Pipeline": (
+        "qwen_image_21",
+        "pipeline_qwen_image_21",
+        "QwenImage21Pipeline",
     ),
     "GlmImagePipeline": (
         "glm_image",
@@ -396,6 +406,11 @@ _DIFFUSION_MODELS = {
         "pipeline_krea2",
         "Krea2Pipeline",
     ),
+    "Kandinsky6TI2VAPipeline": (
+        "kandinsky6",
+        "pipeline_kandinsky6",
+        "Kandinsky6TI2VAPipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
@@ -421,6 +436,10 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
+    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
+    # step-skipping hooks.
+    "QwenImage21Pipeline",
 }
 
 
@@ -646,6 +665,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
@@ -710,6 +731,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -734,6 +756,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
@@ -756,6 +780,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
 }
 
 
