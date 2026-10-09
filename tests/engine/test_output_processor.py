@@ -1227,6 +1227,42 @@ def test_text_path_phase_split_covers_last_streaming_segment(next_input_before_s
     assert len(final_stats.finished_requests) == 1
 
 
+def test_text_path_stop_after_input_end_carries_phase_split():
+    # The end of input reaches the output processor before the engine core,
+    # so the engine core still reports the last segment's stop as a segment
+    # stop. vLLM's process_outputs finishes the request on it, and the split
+    # matches the FinishedRequestStats recorded there.
+    processor = _stats_processor(_make_text_stage_state(stream_input=True))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    processor.add_request(_streaming_input(2.0, resumable=False), prompt=None)
+    iteration_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=iteration_stats,
+    )
+    record = processor.pop_native_text_metrics("r")
+
+    assert "r" not in processor.request_states
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 0}
+    )
+    (finished,) = iteration_stats.finished_requests
+    assert record["vllm_prefill_ms"] == pytest.approx(finished.prefill_time * 1000.0)
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+
+
 def test_generation_stage_phase_split_spans_streaming_segments():
     # The multimodal-only path does not apply streaming updates, so the stats
     # of a generation stage do not restart between segments.
