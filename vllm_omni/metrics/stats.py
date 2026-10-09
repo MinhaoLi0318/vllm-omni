@@ -149,10 +149,10 @@ STAGE_EXCLUDE = {
 DUPLEX_STAGE_TABLE_EXCLUDE = frozenset(
     {
         defs.SERVING_TIME_TO_FIRST_OUTPUT_MS,
-        "vllm_queued_ms",
-        "vllm_prefill_ms",
-        "vllm_decode_ms",
-        "vllm_num_preemptions",
+        defs.VLLM_QUEUED_MS,
+        defs.VLLM_PREFILL_MS,
+        defs.VLLM_DECODE_MS,
+        defs.VLLM_NUM_PREEMPTIONS,
     }
 )
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}

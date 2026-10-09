@@ -21,6 +21,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
@@ -99,16 +100,16 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     queued_ts, scheduled_ts = stats.queued_ts, stats.scheduled_ts
     first_ts, last_ts = stats.first_token_ts, stats.last_token_ts
     if queued_ts > 0 and scheduled_ts >= queued_ts:
-        metrics["vllm_queued_ms"] = (scheduled_ts - queued_ts) * 1000.0
+        metrics[defs.VLLM_QUEUED_MS] = (scheduled_ts - queued_ts) * 1000.0
     if scheduled_ts > 0 and first_ts >= scheduled_ts:
-        metrics["vllm_prefill_ms"] = (first_ts - scheduled_ts) * 1000.0
+        metrics[defs.VLLM_PREFILL_MS] = (first_ts - scheduled_ts) * 1000.0
     if first_ts > 0 and last_ts >= first_ts:
-        metrics["vllm_decode_ms"] = (last_ts - first_ts) * 1000.0
+        metrics[defs.VLLM_DECODE_MS] = (last_ts - first_ts) * 1000.0
     if queued_ts > 0 or scheduled_ts > 0:
         # PREEMPTED rides the same engine-core event stream as QUEUED and
         # SCHEDULED, so a zero count only means something once that stream
         # was observed.
-        metrics["vllm_num_preemptions"] = int(stats.num_preemptions)
+        metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
     return metrics
 
 
