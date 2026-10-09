@@ -986,6 +986,49 @@ def test_end_response_omits_engine_core_phase_split_from_stage_table(
     assert [event.vllm_prefill_ms for event in events] == pytest.approx([20.0, 20.0])
 
 
+def test_end_response_fold_keeps_the_chunk_that_carries_the_phase_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase_fields = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+    logged: list[OrchestratorAggregator] = []
+
+    def _record(self: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record)
+    session = _session(num_stages=3, log_stats=True)
+    response_id = session.begin_response()
+
+    def _chunk(stage_id: int, split: tuple[float | None, float | None, float | None, int | None]):
+        stats = _stage_stats(stage_id=stage_id)
+        for field, value in zip(phase_fields, split):
+            setattr(stats, field, value)
+        return stats
+
+    no_split = (None, None, None, None)
+    # Stage 0: the split arrives on the last chunk, after the first (template) chunk.
+    session.observe_stage_request_stats(0, _chunk(0, no_split))
+    session.observe_stage_request_stats(0, _chunk(0, (1.5, 20.0, 300.0, 0)))
+    # Stage 1: a later chunk without a split does not erase it, and the split
+    # is taken from one chunk, not merged field by field.
+    session.observe_stage_request_stats(1, _chunk(1, (2.0, 30.0, 400.0, 1)))
+    session.observe_stage_request_stats(1, _chunk(1, (None, 35.0, 450.0, 0)))
+    session.observe_stage_request_stats(1, _chunk(1, no_split))
+    # Stage 2: no chunk carries a split.
+    session.observe_stage_request_stats(2, _chunk(2, no_split))
+    session.observe_stage_request_stats(2, _chunk(2, no_split))
+    session.end_response()
+
+    rows = logged[0].stage_events[response_id]
+    assert [row.stage_id for row in rows] == [0, 1, 2]
+    assert [tuple(getattr(row, field) for field in phase_fields) for row in rows] == [
+        (1.5, 20.0, 300.0, 0),
+        (None, 35.0, 450.0, 0),
+        no_split,
+    ]
+
+
 def test_http_stage_table_keeps_engine_core_phase_split() -> None:
     agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
     stats = _stage_stats(stage_id=0)

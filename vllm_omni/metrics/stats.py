@@ -155,6 +155,13 @@ DUPLEX_STAGE_TABLE_EXCLUDE = frozenset(
         defs.VLLM_NUM_PREEMPTIONS,
     }
 )
+# StageRequestStats fields of the engine-core phase split.
+_PHASE_SPLIT_FIELDS = (
+    defs.VLLM_QUEUED_MS,
+    defs.VLLM_PREFILL_MS,
+    defs.VLLM_DECODE_MS,
+    defs.VLLM_NUM_PREEMPTIONS,
+)
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
 
@@ -241,7 +248,16 @@ def _one_row_per_stage(events: list[StageRequestStats]) -> list[StageRequestStat
         tpot_ms = _weighted_tpot_ms(chunks_by_stage[sid])
         if tpot_ms is not None:
             merged[defs.VLLM_TPOT_MS] = tpot_ms
-        rows.append(_apply_merged_stage_stats(templates[sid], merged))
+        row = _apply_merged_stage_stats(templates[sid], merged)
+        # Only the chunk that finished an engine-core request carries its phase
+        # split, and the template (first chunk) usually does not. Copy the split
+        # of the last chunk that has one, without mixing fields across chunks.
+        for chunk in reversed(chunks_by_stage[sid]):
+            if any(getattr(chunk, field) is not None for field in _PHASE_SPLIT_FIELDS):
+                for field in _PHASE_SPLIT_FIELDS:
+                    setattr(row, field, getattr(chunk, field))
+                break
+        rows.append(row)
     return rows
 
 
