@@ -1006,7 +1006,7 @@ def test_native_phase_split_omits_unobserved_intervals(timestamps, expected):
     assert metrics == pytest.approx(expected)
 
 
-def _make_text_stage_state() -> OmniRequestState:
+def _make_text_stage_state(*, stream_input: bool = False) -> OmniRequestState:
     # vLLM's no-tokenizer detokenizer keeps the output on the AR text path
     # (upstream process_outputs) instead of the multimodal-only path.
     return OmniRequestState(
@@ -1023,6 +1023,7 @@ def _make_text_stage_state() -> OmniRequestState:
             ),
         },
         output_kind=RequestOutputKind.CUMULATIVE,
+        stream_input=stream_input,
     )
 
 
@@ -1159,6 +1160,122 @@ def test_no_native_phase_split_without_finished_request_stats(stats_on, is_segme
     record = processor.pop_native_text_metrics("r")
 
     assert not set(_PHASE_KEYS) & set(record)
+
+
+def _streaming_input(arrival_time: float, *, resumable: bool = True) -> SimpleNamespace:
+    # The EngineCoreRequest fields the output processor reads for a request
+    # that is already registered: the next input segment, or (resumable=False)
+    # the end of the input stream.
+    return SimpleNamespace(request_id="r", resumable=resumable, prompt_token_ids=[1], arrival_time=arrival_time)
+
+
+def _phase_split(record: dict) -> dict:
+    return {key: record[key] for key in _PHASE_KEYS if key in record}
+
+
+@pytest.mark.parametrize("next_input_before_stop", [True, False], ids=["queued_before_stop", "after_stop"])
+def test_text_path_phase_split_covers_last_streaming_segment(next_input_before_stop):
+    # On the AR text path, vLLM's process_outputs applies the next streaming
+    # update at a segment stop instead of finishing the request, and the
+    # update restarts the request stats.
+    processor = _stats_processor(_make_text_stage_state(stream_input=True))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    stop_events = None
+    if next_input_before_stop:
+        processor.add_request(_streaming_input(2.9), prompt=None)
+        # The scheduler starts the queued segment at the stop, so its QUEUED
+        # event rides on segment 1's last output, before the stats restart.
+        stop_events = [EngineCoreEvent(EngineCoreEventType.QUEUED, 3.0)]
+    stop_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(events=stop_events, finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=stop_stats,
+    )
+    segment_1 = processor.pop_native_text_metrics("r")
+
+    segment_2_events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0)]
+    if not next_input_before_stop:
+        processor.add_request(_streaming_input(3.4), prompt=None)
+        segment_2_events.insert(0, EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5))
+    processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+    processor.process_outputs(
+        [_stats_output(events=segment_2_events)], engine_core_timestamp=4.5, iteration_stats=IterationStats()
+    )
+    final_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=6.0, iteration_stats=final_stats
+    )
+    segment_2 = processor.pop_native_text_metrics("r")
+
+    assert not stop_stats.finished_requests and not _phase_split(segment_1)
+    expected = {"vllm_prefill_ms": 500.0, "vllm_decode_ms": 1500.0, "vllm_num_preemptions": 0}
+    if not next_input_before_stop:
+        expected["vllm_queued_ms"] = 500.0
+    assert _phase_split(segment_2) == pytest.approx(expected)
+    assert len(final_stats.finished_requests) == 1
+
+
+def test_generation_stage_phase_split_spans_streaming_segments():
+    # The multimodal-only path does not apply streaming updates, so the stats
+    # of a generation stage do not restart between segments.
+    state = OmniRequestState(**_NO_DETOK_STATE_KWARGS, output_kind=RequestOutputKind.CUMULATIVE, stream_input=True)
+    processor = _stats_processor(state)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats(),
+    )
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=IterationStats(),
+    )
+    segment_1 = processor.pop_native_text_metrics("r")
+    processor.add_request(_streaming_input(3.4), prompt=None)
+    processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0),
+                ]
+            )
+        ],
+        engine_core_timestamp=4.5,
+        iteration_stats=IterationStats(),
+    )
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=6.0, iteration_stats=IterationStats()
+    )
+    record = processor.pop_native_text_metrics("r")
+
+    assert not _phase_split(segment_1)
+    # Prefill is segment 1's; decode runs from segment 1's first output to the
+    # last output; segment 2's QUEUED comes after the first SCHEDULED, so the
+    # queue interval would be negative and is left out.
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_prefill_ms": 500.0, "vllm_decode_ms": 4250.0, "vllm_num_preemptions": 0}
+    )
 
 
 def test_ec_transfer_params_survive_both_construction_paths():
