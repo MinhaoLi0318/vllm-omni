@@ -1844,6 +1844,37 @@ def test_stage_pool_metrics_copy_native_phase_split(native_record, expected) -> 
     assert {key: getattr(metrics, key) for key in expected} == expected
 
 
+def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> None:
+    popped: list[str] = []
+
+    class PhaseMetricsOutputProcessor(FakeOutputProcessor):
+        def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+            popped.append(request_id)
+            return {
+                "num_generation_tokens": 2,
+                "vllm_queued_ms": 2.5,
+                "vllm_prefill_ms": 30.0,
+                "vllm_decode_ms": 12.0,
+                "vllm_num_preemptions": 1,
+            }
+
+    pool = StagePool(0, [FakeStageClient(stage_type="llm")], output_processor=PhaseMetricsOutputProcessor())
+    pool.collect_stage_metrics = False
+
+    metrics = pool.build_stage_metrics(
+        [_build_request_output("req-ar")],
+        submit_ts=time.time(),
+        request_timestamp=time.time(),
+        replica_id=0,
+    )
+
+    # The record is still popped so it does not leak, but the optional split stays unset.
+    assert popped == ["req-ar"]
+    assert metrics.num_tokens_out == 2
+    assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
+    assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
+
+
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     pool = StagePool(
