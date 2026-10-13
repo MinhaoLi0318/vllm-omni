@@ -1085,6 +1085,46 @@ def test_engine_core_events_reach_native_phase_split(make_state):
     assert record["vllm_num_preemptions"] == finished.num_preemptions
 
 
+def test_native_phase_split_with_coalesced_decode_output():
+    # A final audio stage folds token-only decode steps into its next emitted
+    # output (is_coalesced). The scheduler never holds the output that carries
+    # prefill stats, and a coalesced output is stamped when it is emitted, so
+    # the split is unchanged; only its ITL sample is dropped.
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    coalesced = _stats_output(new_token_ids=(11, 12, 13))
+    coalesced.is_coalesced = True
+    steps = [
+        (
+            1.75,
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ]
+            ),
+        ),
+        (2.0, _stats_output()),
+        (2.5, coalesced),
+        (3.0, _stats_output(finish_reason=FinishReason.STOP)),
+    ]
+    itls = []
+    for timestamp, output in steps:
+        iteration_stats = IterationStats()
+        processor.process_outputs([output], engine_core_timestamp=timestamp, iteration_stats=iteration_stats)
+        itls += iteration_stats.inter_token_latencies_iter
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 0}
+    )
+    finished = iteration_stats.finished_requests[0]
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+    assert finished.num_generation_tokens == 6
+    assert itls == pytest.approx([0.25, 0.5])
+
+
 def test_one_shot_generation_phase_split_reports_whole_run_as_prefill():
     # A generation stage that emits a single token-less output at stop: the
     # first engine-core output sets the first-token timestamp, so the whole
