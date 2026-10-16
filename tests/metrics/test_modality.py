@@ -16,6 +16,7 @@ from vllm_omni.metrics.modality import (
     observe_modality_at_finalize,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -588,8 +589,9 @@ class TestDiffusionUnitConversion:
             final_stage_id_for_e2e=0,
         )
         for _ in range(2):
-            engine_output = SimpleNamespace(
-                metrics={"diffusion_engine_exec_time_ms": 1000.0, "postprocess_time_ms": 10.0}
+            engine_output = OmniRequestOutput(
+                request_id="req-sparse",
+                metrics={"diffusion_engine_exec_time_ms": 1000.0, "postprocess_time_ms": 10.0},
             )
             aggregator.accumulate_diffusion_metrics("diffusion", "req-sparse", engine_output)
 

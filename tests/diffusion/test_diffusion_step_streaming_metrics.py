@@ -16,7 +16,6 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
-from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +26,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -52,6 +52,19 @@ def _make_request(*, scheduler_queue_wait_ms: float | None = None) -> OmniDiffus
     return request
 
 
+class _ReadyOutputExecutor:
+    """Resolves async outputs the way ``DiffusionExecutor.wait_output_ready``
+    does, from outputs that are already available."""
+
+    def __init__(self, ready_outputs: dict[str, DiffusionOutput]) -> None:
+        self._ready_outputs = ready_outputs
+
+    def wait_output_ready(self, async_output_id: str) -> concurrent.futures.Future[DiffusionOutput]:
+        future: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+        future.set_result(self._ready_outputs[async_output_id])
+        return future
+
+
 def _make_engine(
     outputs: list[DiffusionOutput],
     *,
@@ -63,7 +76,6 @@ def _make_engine(
     ``ready_outputs``. The stream materializes async outputs and records
     ``output_ready_wait_time`` before ``step_streaming`` sees them."""
     engine = DiffusionEngine.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace()
     engine.pre_process_func = pre_process_func
     engine._scheduler_num_waiting_reqs = 0
     engine.main_loop = None
@@ -82,15 +94,10 @@ def _make_engine(
             engine._put_output(request.request_id, output)
         return request.request_id
 
-    def _wait_output_ready(async_output_id: str) -> concurrent.futures.Future:
-        future: concurrent.futures.Future = concurrent.futures.Future()
-        future.set_result((ready_outputs or {})[async_output_id])
-        return future
-
     engine._check_and_start_background_loop = _no_background_loop
     engine._add_prepared_request = _admit
-    engine.postprocess_output = lambda request, output: [SimpleNamespace(metrics={})]
-    engine.executor = SimpleNamespace(wait_output_ready=_wait_output_ready)
+    engine.postprocess_output = lambda request, output: [OmniRequestOutput(request_id=request.request_id)]
+    engine.executor = _ReadyOutputExecutor(ready_outputs or {})
     return engine
 
 
