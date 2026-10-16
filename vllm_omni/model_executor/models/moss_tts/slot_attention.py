@@ -17,7 +17,25 @@ not recover entries overwritten by later tokens of the same input chunk.
 """
 
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+_gdc_launch = tl.extra.cuda.gdc_launch_dependents
+_gdc_wait = tl.extra.cuda.gdc_wait
+
+# Hopper+ supports programmatic dependent launch. The kernel waits for its
+# predecessor before any global access and lets its successor launch at once; results are unchanged.
+_USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
+
+
+def _bthd_out(q: torch.Tensor) -> torch.Tensor:
+    """(B, H, T, D) output backed by (B, T, H, D) storage.
+
+    The codec immediately transposes attention output back to (B, T, H*D), so
+    this layout makes that reshape a view instead of a copy kernel.
+    """
+    b, h, t, d = q.shape
+    return torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
 
 
 @triton.jit
@@ -45,11 +63,13 @@ def _write(
     ring_capacity: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    row_starts: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     slot = tl.load(slots_ptr + row * slot_stride)
     length = tl.load(lengths_ptr + row * length_stride)
-    start = tl.load(end_ptr + slot * end_stride)
+    # end_ptr holds per-slot end offsets, or with row_starts per-row starts.
+    start = tl.load(end_ptr + (row if row_starts else slot) * end_stride)
     x = tl.program_id(1) * block_size + tl.arange(0, block_size)
     dim = x % head_dim
     token = (x // head_dim) % num_frames
@@ -79,6 +99,9 @@ def _attend(
     qs1: tl.constexpr,
     qs2: tl.constexpr,
     qs3: tl.constexpr,
+    os0: tl.constexpr,
+    os1: tl.constexpr,
+    os2: tl.constexpr,
     end_stride: tl.constexpr,
     slot_stride: tl.constexpr,
     length_stride: tl.constexpr,
@@ -91,13 +114,14 @@ def _attend(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     skip_empty_tiles: tl.constexpr = False,
+    row_starts: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
     bh = tl.program_id(1)
     batch, head = bh // num_heads, bh % num_heads
     slot = tl.load(slots_ptr + batch * slot_stride)
     length = tl.load(lengths_ptr + batch * length_stride)
-    start = tl.load(end_ptr + slot * end_stride)
+    start = tl.load(end_ptr + (batch if row_starts else slot) * end_stride)
     end = start + length
     dims = tl.arange(0, head_dim)
     q = tl.load(
@@ -161,7 +185,7 @@ def _attend(
             maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        out_ptr + ((batch * num_heads + head) * num_frames + rows[:, None]) * head_dim + dims[None, :],
+        out_ptr + batch * os0 + head * os1 + rows[:, None] * os2 + dims[None, :],
         out,
         rows[:, None] < num_frames,
     )
@@ -208,6 +232,9 @@ def _write_attend(
     vs1: tl.constexpr,
     vs2: tl.constexpr,
     vs3: tl.constexpr,
+    os0: tl.constexpr,
+    os1: tl.constexpr,
+    os2: tl.constexpr,
     start_stride: tl.constexpr,
     slot_stride: tl.constexpr,
     length_stride: tl.constexpr,
@@ -221,6 +248,7 @@ def _write_attend(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_w: tl.constexpr,
+    skip_empty_tiles: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
     bh = tl.program_id(1)
@@ -254,11 +282,23 @@ def _write_attend(
     acc = tl.full((block_m, head_dim), 0.0, tl.float32)
     maximum = tl.full((block_m,), -float("inf"), tl.float32)
     denominator = tl.full((block_m,), 0.0, tl.float32)
-    if length > 0:
+    # Same exact tile skipping as _attend: omitted tiles are wholly masked, so
+    # their online-softmax update is the identity.
+    if skip_empty_tiles:
+        block_start = tl.program_id(0) * block_m
+        live = (length > 0) & (block_start < length)
+        live = live & (block_start + block_m > tl.maximum(length - ring_capacity, 0))
+    else:
+        live = length > 0
+    if live:
         last = end - 1
         last_index = last % ring_capacity
-        for first in range(tl.cdiv(ring_capacity, block_n)):
-            cols = first * block_n + tl.arange(0, block_n)
+        if skip_empty_tiles:
+            key_blocks = tl.cdiv(tl.minimum(end, ring_capacity), block_n)
+        else:
+            key_blocks = tl.cdiv(ring_capacity, block_n)
+        for block in range(key_blocks):
+            cols = block * block_n + tl.arange(0, block_n)
             delta = cols - last_index
             positions = tl.where(delta <= 0, last + delta, last + delta - ring_capacity)
             distance = start + rows[:, None] - positions[None, :]
@@ -288,7 +328,7 @@ def _write_attend(
             maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        out_ptr + ((batch * num_heads + head) * num_frames + rows[:, None]) * head_dim + dims[None, :],
+        out_ptr + batch * os0 + head * os1 + rows[:, None] * os2 + dims[None, :],
         out,
         rows[:, None] < num_frames,
     )
@@ -305,11 +345,13 @@ def slot_ring_attention(
     valid_lengths: torch.Tensor,
     context: int = -1,
     skip_empty_tiles: bool = False,
+    advance_offsets: bool = True,
 ) -> torch.Tensor:
     """Fused address/mask path, with three ordered launches and no KV gather.
 
     q/k are already rotary-position encoded. The caller still advances its
-    separate MHA/RoPE offset state; this op advances only end_offset in place.
+    separate MHA/RoPE offset state. ``advance_offsets=False`` leaves the shared
+    resolution group's offsets to its owner; the default advances end_offset.
     context=-1 means unbounded causal attention over available ring entries.
     Outputs beyond each row's valid_lengths are exactly zero.
     skip_empty_tiles skips wholly masked tiles for small (T <= 32) chunks.
@@ -335,7 +377,7 @@ def slot_ring_attention(
         raise ValueError("all tensors must share one CUDA device")
     if context == 0 or context < -1:
         raise ValueError("context must be -1 or positive")
-    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    out = _bthd_out(q)
     if b == 0:
         return out
     strides = (end_offset.stride(0), slot_ids.stride(0), valid_lengths.stride(0))
@@ -351,6 +393,7 @@ def slot_ring_attention(
         valid_lengths,
         out,
         *q.stride(),
+        *out.stride()[:3],
         *strides,
         s,
         h,
@@ -364,7 +407,8 @@ def slot_ring_attention(
         num_warps=8 if c <= 256 else 4,
         num_stages=2,
     )
-    _advance[(1,)](end_offset, slot_ids, valid_lengths, *strides, b, triton.next_power_of_2(b))
+    if advance_offsets:
+        _advance[(1,)](end_offset, slot_ids, valid_lengths, *strides, b, triton.next_power_of_2(b))
     return out
 
 
@@ -379,8 +423,9 @@ def _(
     valid_lengths: torch.Tensor,
     context: int = -1,
     skip_empty_tiles: bool = False,
+    advance_offsets: bool = True,
 ) -> torch.Tensor:
-    return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    return _bthd_out(q)
 
 
 def _check_inputs(q, k, v, cache, metadata, context):
@@ -403,6 +448,11 @@ def _check_inputs(q, k, v, cache, metadata, context):
         raise ValueError("context must be -1 or positive")
 
 
+# Measured crossover on H200 (codec stages, B=8..32): the single fused launch
+# wins up to T=120 frames, the write + attend pair from T=240.
+_FUSED_ROWS_MAX_FRAMES = 128
+
+
 @torch.library.custom_op("vllm_omni::moss_slot_ring_attention_rows", mutates_args=("cache",))
 def slot_ring_attention_rows(
     q: torch.Tensor,
@@ -413,6 +463,7 @@ def slot_ring_attention_rows(
     slot_ids: torch.Tensor,
     valid_lengths: torch.Tensor,
     context: int = -1,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
     """``slot_ring_attention`` as one launch, with per-row start positions.
 
@@ -425,11 +476,58 @@ def slot_ring_attention_rows(
     _check_inputs(q, k, v, cache, (starts, slot_ids, valid_lengths), context)
     if starts.shape != (b,) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):
         raise ValueError("invalid metadata shapes")
-    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    out = _bthd_out(q)
     if b == 0:
         return out
     s, c = cache.shape[1], cache.shape[3]
     bm = 16 if t <= 32 else 64
+    if t > _FUSED_ROWS_MAX_FRAMES:
+        # Long chunks: every fused program would rewrite the whole chunk for
+        # its head. One write launch, then the attention launch, is faster
+        # there and computes the identical ring and output.
+        strides = (starts.stride(0), slot_ids.stride(0), valid_lengths.stride(0))
+        _write[(b, triton.cdiv(h * t * d, 256))](
+            k,
+            v,
+            cache,
+            starts,
+            slot_ids,
+            valid_lengths,
+            *k.stride(),
+            *v.stride(),
+            *strides,
+            s,
+            h,
+            t,
+            c,
+            d,
+            256,
+            row_starts=True,
+        )
+        _attend[(triton.cdiv(t, bm), b * h)](
+            q,
+            cache,
+            starts,
+            slot_ids,
+            valid_lengths,
+            out,
+            *q.stride(),
+            *out.stride()[:3],
+            *strides,
+            s,
+            h,
+            t,
+            c,
+            d,
+            context,
+            bm,
+            64,
+            skip_empty_tiles=False,
+            row_starts=True,
+            num_warps=8 if c <= 256 else 4,
+            num_stages=2,
+        )
+        return out
     _write_attend[(triton.cdiv(t, bm), b * h)](
         q,
         k,
@@ -442,6 +540,7 @@ def slot_ring_attention_rows(
         *q.stride(),
         *k.stride(),
         *v.stride(),
+        *out.stride()[:3],
         starts.stride(0),
         slot_ids.stride(0),
         valid_lengths.stride(0),
@@ -455,6 +554,7 @@ def slot_ring_attention_rows(
         bm,
         64,
         16,
+        skip_empty_tiles=skip_empty_tiles and t <= 32,
         num_warps=8 if c <= 256 else 4,
         num_stages=2,
     )
@@ -471,5 +571,335 @@ def _(
     slot_ids: torch.Tensor,
     valid_lengths: torch.Tensor,
     context: int = -1,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
-    return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    return _bthd_out(q)
+
+
+@triton.jit
+def _exp_ftz(x):
+    # tl.exp(x) lowers to ex2.approx.f32(x * log2e); .ftz only drops the
+    # subnormal-result fixup, so results differ only below 2**-126.
+    return tl.inline_asm_elementwise(
+        "ex2.approx.ftz.f32 $0, $1;", "=f,f", [x * 1.4426950408889634], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _ring_flash(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    cache_ptr,
+    starts_ptr,
+    slots_ptr,
+    lengths_ptr,
+    out_ptr,
+    qs0: tl.constexpr,
+    qs1: tl.constexpr,
+    qs2: tl.constexpr,
+    qs3: tl.constexpr,
+    ks0: tl.constexpr,
+    ks1: tl.constexpr,
+    ks2: tl.constexpr,
+    ks3: tl.constexpr,
+    vs0: tl.constexpr,
+    vs1: tl.constexpr,
+    vs2: tl.constexpr,
+    vs3: tl.constexpr,
+    os0: tl.constexpr,
+    os1: tl.constexpr,
+    os2: tl.constexpr,
+    start_stride: tl.constexpr,
+    slot_stride: tl.constexpr,
+    length_stride: tl.constexpr,
+    state_capacity: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_frames: tl.constexpr,
+    ring_capacity: tl.constexpr,
+    head_dim: tl.constexpr,
+    context_size: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    row_starts: tl.constexpr,
+    skip_interior_mask: tl.constexpr,
+    fma_scale: tl.constexpr,
+    USE_PDL: tl.constexpr = False,  # noqa: N803
+):
+    """Ring write + attention in one pass, without redundant work.
+
+    Each program owns ``block_m`` query rows of one (row, head) and writes
+    only those rows' K/V into the ring. Keys of the current chunk (positions
+    >= start) are read straight from k/v, older keys from the ring. A chunk
+    only overwrites slots holding positions < end - capacity, which no query
+    attends to, so no program reads a slot that another program writes.
+
+    The visited tiles retain ``_attend``'s physical ring order and online
+    softmax update. Tested configurations match exactly; this is not a
+    universal bitwise guarantee, since FTZ drops subnormal weights and Triton
+    may change reduction layouts. Differences from ``_attend``:
+    - only key tiles holding an allowed (query, key) pair of this block are
+      visited; a wholly masked tile's update is the identity;
+    - exp uses ex2.approx.ftz (equal unless a weight is below 2**-126);
+    - skip_interior_mask: interior tiles (every row valid, every key allowed)
+      skip the mask;
+    - fma_scale: a power-of-two softmax scale is applied by an FMA after the
+      row max (exact: the product is exact, so fma rounds like mul + sub).
+    The last two change the surrounding code, and Triton may then choose a
+    different MMA/reduction layout for multi-warpgroup tiles; the launcher
+    enables them only for the single-warpgroup 64-row tile.
+
+    """
+    if USE_PDL:
+        _gdc_wait()
+        _gdc_launch()
+    pid_m = tl.program_id(0)
+    bh = tl.program_id(1)
+    batch, head = bh // num_heads, bh % num_heads
+    slot = tl.load(slots_ptr + batch * slot_stride)
+    length = tl.load(lengths_ptr + batch * length_stride).to(tl.int32)
+    start = tl.load(starts_ptr + (batch if row_starts else slot) * start_stride)
+    end = start + length
+    row_limit = num_frames
+    rows = pid_m * block_m + tl.arange(0, block_m)
+    dims = tl.arange(0, head_dim)
+    base = (slot * num_heads + head) * ring_capacity * head_dim
+    v_base = state_capacity * num_heads * ring_capacity * head_dim + base
+    q_ptr += batch * qs0 + head * qs1
+    out_ptr += batch * os0 + head * os1
+    k_row = k_ptr + batch * ks0 + head * ks1
+    v_row = v_ptr + batch * vs0 + head * vs1
+    scale: tl.constexpr = head_dim**-0.5
+
+    # Ring write of this block's rows. Chunks longer than the ring keep only
+    # their final ring_capacity tokens (no duplicate addresses in a launch).
+    keep = (rows >= tl.maximum(length - ring_capacity, 0)) & (rows < length)
+    dst = ((start + rows) % ring_capacity)[:, None] * head_dim + dims[None, :]
+    kval = tl.load(k_row + rows[:, None] * ks2 + dims[None, :] * ks3, keep[:, None], 0)
+    vval = tl.load(v_row + rows[:, None] * vs2 + dims[None, :] * vs3, keep[:, None], 0)
+    tl.store(cache_ptr + base + dst, kval, keep[:, None])
+    tl.store(cache_ptr + v_base + dst, vval, keep[:, None])
+
+    q = tl.load(q_ptr + rows[:, None] * qs2 + dims[None, :] * qs3, rows[:, None] < row_limit, 0)
+    acc = tl.full((block_m, head_dim), 0.0, tl.float32)
+    maximum = tl.full((block_m,), -float("inf"), tl.float32)
+    denominator = tl.full((block_m,), 0.0, tl.float32)
+    # [lo, hi]: union of the allowed key positions of this block's valid rows.
+    row_lo = pid_m * block_m
+    row_hi = tl.minimum(row_lo + block_m, length) - 1
+    lo = tl.maximum(end - ring_capacity, 0)
+    if context_size > 0:
+        lo = tl.maximum(lo, start + row_lo - context_size + 1)
+    hi = start + row_hi
+    if (row_lo < length) & (lo <= hi):
+        # Physical column c holds token (position - start)
+        # c - last_index + newest, minus the capacity past the newest column.
+        last_index = ((end - 1) % ring_capacity).to(tl.int32)
+        newest = length - 1
+        # position >= 0 <=> token >= -start (start may exceed int32).
+        min_token = (-tl.minimum(start, ring_capacity)).to(tl.int32)
+        tile_lo = ((lo % ring_capacity) // block_n).to(tl.int32)
+        tile_hi = ((hi % ring_capacity) // block_n).to(tl.int32)
+        num_tiles: tl.constexpr = (ring_capacity + block_n - 1) // block_n
+        # A wrapped range visits physical tiles [0, tile_hi] then
+        # [tile_lo, num_tiles), keeping the ascending physical order.
+        wrapped = lo % ring_capacity > hi % ring_capacity
+        first_start = tl.where(wrapped, 0, tile_lo)
+        first_count = tl.where(wrapped, tile_hi + 1, tile_hi - tile_lo + 1)
+        second_start = tl.maximum(tile_lo, tile_hi + 1)
+        second_count = tl.where(wrapped, num_tiles - second_start, 0)
+        row_key = tl.where(rows < length, rows, -(1 << 30))
+        for i in range(first_count + second_count):
+            block = tl.where(i < first_count, first_start + i, second_start + i - first_count)
+            cols = block * block_n + tl.arange(0, block_n)
+            token = cols - last_index + newest - tl.where(cols > last_index, ring_capacity, 0)
+            in_ring = cols < ring_capacity
+            fresh = in_ring & (token >= 0)
+            k_src = tl.where(
+                fresh[None, :],
+                k_row + token[None, :] * ks2 + dims[:, None] * ks3,
+                cache_ptr + base + cols[None, :] * head_dim + dims[:, None],
+            )
+            k = tl.load(k_src, in_ring[None, :], 0)
+            score = tl.dot(q, k).to(tl.float32)
+            if not fma_scale:
+                score = score * scale
+            interior = False
+            if skip_interior_mask:
+                tile_first = block * block_n
+                first_token = tile_first - last_index + newest - tl.where(tile_first > last_index, ring_capacity, 0)
+                interior = (row_lo + block_m <= length) & (tile_first + block_n <= ring_capacity)
+                interior &= (tile_first > last_index) | (tile_first + block_n - 1 <= last_index)
+                interior &= (first_token >= min_token) & (first_token + block_n - 1 <= row_lo)
+                if context_size > 0:
+                    interior &= row_lo + block_m - 1 - first_token < context_size
+            if not interior:
+                # distance = start + row - position = row - token; invalid
+                # rows and keys get distances outside [0, context).
+                key_token = tl.where(in_ring & (token >= min_token), token, 1 << 30)
+                distance = row_key[:, None] - key_token[None, :]
+                if context_size > 0:
+                    allowed = distance.to(tl.uint32, bitcast=True) < context_size
+                else:
+                    allowed = distance >= 0
+                score = tl.where(allowed, score, -float("inf"))
+            if fma_scale:
+                # max(score * scale) == max(score) * scale for a power-of-two
+                # scale, and fma(score, scale, -m) rounds once like the exact
+                # product minus m.
+                next_max = tl.maximum(maximum, tl.max(score, 1) * scale)
+            else:
+                next_max = tl.maximum(maximum, tl.max(score, 1))
+            safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+            rescale = tl.exp(maximum - safe_max)
+            if fma_scale:
+                p = _exp_ftz(tl.fma(score, scale, -safe_max[:, None]))
+            else:
+                p = _exp_ftz(score - safe_max[:, None])
+            denominator = denominator * rescale + tl.sum(p, 1)
+            v_src = tl.where(
+                fresh[:, None],
+                v_row + token[:, None] * vs2 + dims[None, :] * vs3,
+                cache_ptr + v_base + cols[:, None] * head_dim + dims[None, :],
+            )
+            v = tl.load(v_src, in_ring[:, None], 0)
+            acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v)
+            maximum = next_max
+    out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
+    tl.store(out_ptr + rows[:, None] * os2 + dims[None, :], out, rows[:, None] < row_limit)
+
+
+def _flash_config(t: int, c: int) -> tuple[int, int, int]:
+    """(block_m, num_warps, num_stages); block_m/num_warps match ``_attend``.
+
+    The MMA instruction and reduction layout follow block_m and num_warps, so
+    keeping the existing choice keeps every row's arithmetic identical.
+    """
+    return (16 if t <= 32 else 64), (8 if c <= 256 else 4), 2
+
+
+def _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_starts, config=None):
+    b, h, t, d = q.shape
+    s, c = cache.shape[1], cache.shape[3]
+    out = _bthd_out(q)
+    if b == 0:
+        return out
+    bm, nw, ns = config or _flash_config(t, c)
+    one_warpgroup = bm == 64 and nw == 4
+    _ring_flash[(triton.cdiv(t, bm), b * h)](
+        q,
+        k,
+        v,
+        cache,
+        starts,
+        slot_ids,
+        valid_lengths,
+        out,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride()[:3],
+        starts.stride(0),
+        slot_ids.stride(0),
+        valid_lengths.stride(0),
+        s,
+        h,
+        t,
+        c,
+        d,
+        context,
+        bm,
+        64,
+        row_starts,
+        one_warpgroup,
+        one_warpgroup and d == 64,
+        USE_PDL=_USE_PDL,
+        launch_pdl=_USE_PDL,
+        num_warps=nw,
+        num_stages=ns,
+    )
+    return out
+
+
+@torch.library.custom_op("vllm_omni::moss_slot_ring_flash_attention", mutates_args=("cache", "end_offset"))
+def slot_ring_flash_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    end_offset: torch.Tensor,
+    slot_ids: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    context: int = -1,
+    skip_empty_tiles: bool = False,
+) -> torch.Tensor:
+    """``slot_ring_attention`` with the single-pass flash ring kernel.
+
+    Same state and masking contract; one write+attend launch plus the offset
+    advance. FTZ and reduction-layout choices prevent a universal bitwise
+    output guarantee. ``skip_empty_tiles`` is accepted for signature
+    compatibility: this kernel always skips wholly masked tiles.
+    """
+    b = q.shape[0]
+    _check_inputs(q, k, v, cache, (end_offset, slot_ids, valid_lengths), context)
+    if end_offset.shape != (cache.shape[1],) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):
+        raise ValueError("invalid metadata shapes")
+    out = _launch_flash(q, k, v, cache, end_offset, slot_ids, valid_lengths, context, row_starts=False)
+    if b:
+        strides = (end_offset.stride(0), slot_ids.stride(0), valid_lengths.stride(0))
+        _advance[(1,)](end_offset, slot_ids, valid_lengths, *strides, b, triton.next_power_of_2(b))
+    return out
+
+
+@slot_ring_flash_attention.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    end_offset: torch.Tensor,
+    slot_ids: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    context: int = -1,
+    skip_empty_tiles: bool = False,
+) -> torch.Tensor:
+    return _bthd_out(q)
+
+
+@torch.library.custom_op("vllm_omni::moss_slot_ring_flash_attention_rows", mutates_args=("cache",))
+def slot_ring_flash_attention_rows(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    starts: torch.Tensor,
+    slot_ids: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    context: int = -1,
+    skip_empty_tiles: bool = False,
+) -> torch.Tensor:
+    """``slot_ring_attention_rows`` with the single-pass flash ring kernel.
+
+    One launch per chunk, preserving ring updates and causal masking; see
+    ``_ring_flash`` for the numerical limitations.
+    """
+    b = q.shape[0]
+    _check_inputs(q, k, v, cache, (starts, slot_ids, valid_lengths), context)
+    if starts.shape != (b,) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):
+        raise ValueError("invalid metadata shapes")
+    return _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_starts=True)
+
+
+@slot_ring_flash_attention_rows.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    starts: torch.Tensor,
+    slot_ids: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    context: int = -1,
+    skip_empty_tiles: bool = False,
+) -> torch.Tensor:
+    return _bthd_out(q)
