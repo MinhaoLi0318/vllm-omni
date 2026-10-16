@@ -291,7 +291,7 @@ With `--log-stats`, a stage served by a vLLM engine core (AR and generation stag
 | `vllm_input_wait_ms` | `QUEUED` event to the step in which the stage's input gate first saw the input ready |
 | `vllm_ready_queued_ms` | That step to first `SCHEDULED` event |
 
-The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. No Prometheus family is added.
+The first four fields match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. The last two fields split `vllm_queued_ms` at a time recorded by the Omni scheduler, described below; upstream has no counterpart. No Prometheus family is added.
 
 The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`.
 
