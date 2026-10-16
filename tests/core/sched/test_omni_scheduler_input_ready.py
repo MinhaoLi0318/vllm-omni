@@ -3,7 +3,6 @@
 """Input-ready time of downstream-stage requests, which splits vllm_queued_ms."""
 
 import time
-from types import SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
@@ -123,12 +122,16 @@ def test_input_ready_time_covers_requests_holding_kv_blocks():
     assert request.omni_input_ready_ts == 1.0
 
 
-def _init_gate_flag(**model_config) -> bool:
+def _init_gate_flag(**model_config_fields) -> bool:
     class _Scheduler(omni_scheduler_mixin.OmniSchedulerMixin):
         pass
 
     scheduler = _Scheduler()
-    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(**model_config))
+    model_config = object.__new__(OmniModelConfig)
+    for name, value in model_config_fields.items():
+        setattr(model_config, name, value)
+    scheduler.vllm_config = object.__new__(VllmConfig)
+    scheduler.vllm_config.model_config = model_config
     scheduler._init_omni_io_scheduling_state()
     return scheduler._gates_stage_input
 
@@ -145,7 +148,8 @@ def _init_gate_flag(**model_config) -> bool:
     ],
 )
 def test_gates_stage_input_follows_the_input_gates(monkeypatch, stage_id, async_chunk, required, role, expected):
-    monkeypatch.setattr(omni_scheduler_mixin, "OmniChunkTransferAdapter", lambda _config: SimpleNamespace())
+    adapter_cls = omni_scheduler_mixin.OmniChunkTransferAdapter
+    monkeypatch.setattr(omni_scheduler_mixin, "OmniChunkTransferAdapter", lambda _config: object.__new__(adapter_cls))
 
     flag = _init_gate_flag(
         stage_id=stage_id,
@@ -192,7 +196,8 @@ def test_gates_stage_input_on_the_native_data_plane(role, expected):
 )
 def test_engine_output_sends_input_ready_time_with_engine_core_events(events, ready_ts, expected):
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
-    request = SimpleNamespace(request_id="r", trace_headers=None, take_events=lambda: events)
+    request = Request("r", [1], SamplingParams(max_tokens=1), pooling_params=None)
+    request.events = list(events or [])
     if ready_ts is not None:
         request.omni_input_ready_ts = ready_ts
 
