@@ -6,7 +6,8 @@ An interval that was not observed is left out of the output metrics instead of
 being written as ``0.0``; a measured ``0`` stays. The tests drive
 ``step_streaming`` on CPU with a stubbed scheduler stream and executor, then
 follow the keys through ``OrchestratorAggregator`` into the per-request
-``StageRequestStats`` record and the ``[StageRequestStats]`` table.
+``StageRequestStats`` record and the ``stage_table`` rows that
+``build_and_log_summary`` returns.
 """
 
 from __future__ import annotations
@@ -152,6 +153,20 @@ async def test_output_ready_wait_is_per_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_output_ready_wait_does_not_carry_to_the_next_output() -> None:
+    """A synchronous output after an async one does not inherit its wait."""
+    engine = _make_engine(
+        [DiffusionOutput(async_output_id="out-1", finished=False), DiffusionOutput()],
+        ready_outputs={"out-1": DiffusionOutput(finished=False)},
+    )
+
+    first, second = await _collect_metrics(engine, _make_request())
+
+    assert first["output_ready_wait_time_ms"] >= 0.0
+    assert "output_ready_wait_time_ms" not in second
+
+
+@pytest.mark.asyncio
 async def test_debug_breakdown_formats_unobserved_intervals() -> None:
     records: list[str] = []
 
@@ -193,7 +208,8 @@ def _stage_stats() -> StageRequestStats:
 @pytest.mark.asyncio
 async def test_unobserved_intervals_stay_out_of_the_stage_record() -> None:
     """Follow the engine keys through the aggregator into the per-request
-    record and the logged ``[StageRequestStats]`` table."""
+    record and the ``stage_table`` rows that ``build_and_log_summary``
+    returns."""
     engine = _make_engine([DiffusionOutput()])
     request = _make_request(scheduler_queue_wait_ms=2.0)
     outputs = [out async for batch in engine.step_streaming(request) for out in batch]
