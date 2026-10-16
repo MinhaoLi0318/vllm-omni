@@ -109,6 +109,20 @@ def test_input_ready_time_skips_requests_not_waiting_for_admission(status):
     assert getattr(request, "omni_input_ready_ts", None) is None
 
 
+def test_input_ready_time_covers_requests_holding_kv_blocks():
+    scheduler = _gated_scheduler(async_chunk=False)
+    scheduler.input_coordinator = None
+    request = Request("held", [1, 2], SamplingParams(max_tokens=1), pooling_params=None)
+    request.num_computed_tokens = 1
+    scheduler.requests = {request.request_id: request}
+    scheduler._enqueue_waiting_request(request)
+    assert request in scheduler.kv_holding_waiting
+
+    scheduler._stamp_input_ready(1.0)
+
+    assert request.omni_input_ready_ts == 1.0
+
+
 def _init_gate_flag(**model_config) -> bool:
     class _Scheduler(omni_scheduler_mixin.OmniSchedulerMixin):
         pass
