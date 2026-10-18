@@ -48,7 +48,9 @@ schema source for AR and generation stages:
 - `OmniStageSchedulerConfig` inherits `vllm.config.SchedulerConfig`.
 - `OmniStageParallelConfig` inherits `vllm.config.ParallelConfig`.
 - `OmniStageLoRAConfig` inherits `vllm.config.LoRAConfig`; like
-  `VllmConfig.lora_config`, a stage carries it only when `enable_lora` is set.
+  `VllmConfig.lora_config`, a stage carries it only when `enable_lora` is set. See
+  [LoRA](../feature/lora.md) for how LoRA options and request adapters reach
+  each stage.
 
 This inheritance preserves the existing load, cache, scheduler, parallel, and
 LoRA concern boundaries while reducing duplicate downstream declarations. It

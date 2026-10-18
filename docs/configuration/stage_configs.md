@@ -418,6 +418,8 @@ The equivalent CLI and Python forms are
   A global value on a pipeline with a diffusion stage sizes only the diffusion
   cache; set an LLM stage's value with a stage-scoped key.
 
+The design is described in [LoRA](../design/feature/lora.md).
+
 ### Worked override example
 
 Starting from the bundled `vllm_omni/deploy/qwen3_omni_moe.yaml`:
