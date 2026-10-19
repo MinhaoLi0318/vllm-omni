@@ -310,6 +310,55 @@ async def test_codec_stats_start_at_its_own_first_output_after_first_audio():
 
 
 @pytest.mark.asyncio
+async def test_codec_outputs_parked_for_first_audio_keep_engine_core_timestamps(mocker):
+    # Codec outputs that overtake the first-audio frame are parked and replayed
+    # after it. The replay keeps the engine-core timestamp of the batch each
+    # output arrived in, so the codec's split and ITLs leave out the wait for
+    # the frame. TTFT is taken when the output is processed, as in vLLM, so it
+    # is measured at replay and includes that wait.
+    obj = _orchestrator()
+    obj._prom_metrics = None
+    obj._stat_logger = Mock()
+    obj._stage_replica_to_engine_idx = {}
+    obj._handle_kv_ready_raw_outputs = AsyncMock()
+    obj._apply_raw_terminal_stage_finish = AsyncMock(return_value=False)
+    obj._report_duplex_session_request_error = AsyncMock()
+    obj._process_llm_stage_outputs = Orchestrator._process_llm_stage_outputs.__get__(obj)
+    # Wall clock read by IterationStats; the request arrived at 100.0.
+    clock = SimpleNamespace(now=101.0)
+    mocker.patch("vllm.v1.metrics.stats.time", SimpleNamespace(time=lambda: clock.now))
+    obj.stage_pools[1].output_processor.request_states["r"].native_text_stats.arrival_time = 100.0
+
+    queued_and_scheduled = [
+        EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+        EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+    ]
+    for timestamp, events, required in [(1.75, queued_and_scheduled, True), (2.25, None, False)]:
+        raw = _raw(required=required)
+        raw.timestamp = timestamp
+        raw.outputs[0].events = events
+        await obj._process_llm_stage_outputs(1, 2, raw, set())
+    assert len(obj.request_states["r"].pending_first_audio_outputs) == 2
+    obj._stat_logger.record.assert_not_called()
+
+    clock.now = 104.0
+    await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
+    raw = _raw(terminal=True)
+    raw.timestamp = 3.0
+    await obj._process_llm_stage_outputs(1, 2, raw, set())
+
+    record = obj.stage_pools[1].output_processor.pop_native_text_metrics("r")
+    assert {key: record.get(key) for key in ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms")} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0}
+    )
+    assert record["vllm_itls_ms"] == pytest.approx([500.0, 750.0])
+    assert record["vllm_ttft_ms"] == pytest.approx(4000.0)
+    recorded = [call.args[1] for call in obj._stat_logger.record.call_args_list]
+    assert [ttft for stats in recorded for ttft in stats.time_to_first_tokens_iter] == pytest.approx([4.0])
+    assert [itl for stats in recorded for itl in stats.inter_token_latencies_iter] == pytest.approx([0.5, 0.75])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("processing_failed", [False, True])
 async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, processing_failed):
     obj = _orchestrator(registered=False, final_stage_id=2 if processing_failed else 1)
