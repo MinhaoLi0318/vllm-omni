@@ -200,8 +200,11 @@ def test_generation_schedule_stamps_input_ready_with_the_scheduled_timestamp() -
     calls: list[object] = []
     sched._process_pending_omni_inputs.side_effect = lambda model_mode: calls.append(model_mode)
     sched._stamp_input_ready.side_effect = lambda now: calls.append(now)
+    sched._restore_omni_wait_queues.side_effect = lambda: calls.append("restore")
 
     OmniGenerationScheduler.schedule(sched)
 
     (scheduled,) = [event for event in request.take_events() if event.type == EngineCoreEventType.SCHEDULED]
-    assert calls == ["generation", scheduled.timestamp]
+    # Stamping before the parked requests are restored keeps the scan to the
+    # requests the gate left in the queues.
+    assert calls[:3] == ["generation", scheduled.timestamp, "restore"]

@@ -9,7 +9,7 @@ from vllm import SamplingParams
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
 from vllm_omni.config.model import OmniModelConfig
@@ -17,6 +17,7 @@ from vllm_omni.core.sched import omni_scheduler_mixin
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,14 +33,17 @@ def _gated_scheduler(*, async_chunk: bool, log_stats: bool = True, gates_stage_i
         stage_id=1, scheduler_max_num_seqs=2, async_chunk=async_chunk
     )
     scheduler._init_omni_connector_output_inbox()
+    scheduler.requests = {}
     scheduler.log_stats = log_stats
     scheduler._gates_stage_input = gates_stage_input
     return scheduler
 
 
-def _add_request(scheduler: OmniARScheduler, request_id: str = "downstream") -> Request:
-    request = Request(request_id, [1], SamplingParams(max_tokens=1), pooling_params=None)
-    scheduler.requests = {request.request_id: request}
+def _add_request(scheduler: OmniARScheduler, request_id: str = "downstream") -> OmniRequest:
+    # The Omni request type, as the engine creates it; the input gates read
+    # its external_req_id.
+    request = OmniRequest(request_id, [1], SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler.requests[request.request_id] = request
     scheduler._enqueue_waiting_request(request)
     return request
 
@@ -68,14 +72,40 @@ def test_input_gate_records_the_first_step_that_sees_input_ready(async_chunk):
     _step(scheduler, 1.0)
     _step(scheduler, 2.0)
     assert getattr(request, "omni_input_ready_ts", None) is None
+    assert not getattr(request, "omni_input_ready_stamped", False)
 
     _step(scheduler, 3.0, _ready_output(async_chunk))
     assert request.status == RequestStatus.WAITING
     assert request.omni_input_ready_ts == 3.0
+    assert request.omni_input_ready_stamped
 
     # Only the first input is recorded.
     _step(scheduler, 4.0, _ready_output(async_chunk))
     assert request.omni_input_ready_ts == 3.0
+
+
+@pytest.mark.parametrize("async_chunk", [False, True], ids=["full_payload", "async_chunk"])
+def test_ready_backlog_is_stamped_once(async_chunk):
+    # Requests whose input is ready but that upstream does not schedule yet
+    # stay in the waiting queue; later steps keep the time of the step that
+    # first saw them ready.
+    scheduler = _gated_scheduler(async_chunk=async_chunk)
+    requests = [_add_request(scheduler, f"r{index}") for index in range(4)]
+    request_ids = set(scheduler.requests)
+    if async_chunk:
+        ready = OmniConnectorOutput(chunk_ready_req_ids=request_ids)
+    else:
+        ready = OmniConnectorOutput(stage_recv_req_ids=request_ids)
+
+    _step(scheduler, 1.0)
+    _step(scheduler, 2.0, ready)
+    for now in (3.0, 4.0, 5.0):
+        _step(scheduler, now)
+
+    assert all(request in scheduler.waiting for request in requests)
+    assert all(request.status == RequestStatus.WAITING for request in requests)
+    assert all(request.omni_input_ready_ts == 2.0 for request in requests)
+    assert all(request.omni_input_ready_stamped for request in requests)
 
 
 @pytest.mark.parametrize(
@@ -85,12 +115,17 @@ def test_input_gate_records_the_first_step_that_sees_input_ready(async_chunk):
 )
 def test_input_ready_time_needs_an_input_gate_and_stats(log_stats, gates_stage_input):
     scheduler = _gated_scheduler(async_chunk=False, log_stats=log_stats, gates_stage_input=gates_stage_input)
-    request = _add_request(scheduler)
+    requests = [_add_request(scheduler, f"r{index}") for index in range(3)]
 
-    _step(scheduler, 1.0, _ready_output(async_chunk=False))
+    _step(scheduler, 1.0, OmniConnectorOutput(stage_recv_req_ids=set(scheduler.requests)))
+    _step(scheduler, 2.0)
 
-    assert request.status == RequestStatus.WAITING
-    assert getattr(request, "omni_input_ready_ts", None) is None
+    for request in requests:
+        assert request.status == RequestStatus.WAITING
+        assert getattr(request, "omni_input_ready_ts", None) is None
+        assert not hasattr(request, "omni_input_ready_stamped")
+        request.events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.5)]
+        assert scheduler._make_omni_engine_output(request, new_token_ids=[]).input_ready_ts is None
 
 
 @pytest.mark.parametrize(
@@ -111,7 +146,7 @@ def test_input_ready_time_skips_requests_not_waiting_for_admission(status):
 def test_input_ready_time_covers_requests_holding_kv_blocks():
     scheduler = _gated_scheduler(async_chunk=False)
     scheduler.input_coordinator = None
-    request = Request("held", [1, 2], SamplingParams(max_tokens=1), pooling_params=None)
+    request = OmniRequest("held", [1, 2], SamplingParams(max_tokens=1), pooling_params=None)
     request.num_computed_tokens = 1
     scheduler.requests = {request.request_id: request}
     scheduler._enqueue_waiting_request(request)
@@ -120,6 +155,39 @@ def test_input_ready_time_covers_requests_holding_kv_blocks():
     scheduler._stamp_input_ready(1.0)
 
     assert request.omni_input_ready_ts == 1.0
+    assert request.omni_input_ready_stamped
+
+
+def test_input_ready_time_is_sent_once_and_not_stamped_again():
+    scheduler = _gated_scheduler(async_chunk=False)
+    request = _add_request(scheduler)
+    _step(scheduler, 1.0)
+    _step(scheduler, 2.0, _ready_output(async_chunk=False))
+    request.events = [
+        EngineCoreEvent(EngineCoreEventType.QUEUED, 0.5),
+        EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.5),
+    ]
+
+    first = scheduler._make_omni_engine_output(request, new_token_ids=[])
+
+    # Sent with the first SCHEDULED event, then cleared; the marker stays.
+    assert first.input_ready_ts == 2.0
+    assert request.omni_input_ready_ts is None
+    assert request.omni_input_ready_stamped
+
+    # Scheduled, then back in the waiting queue as WAITING (e.g. a later
+    # streaming segment) with its input ready: not stamped again.
+    scheduler.waiting.remove_request(request)
+    scheduler._enqueue_waiting_request(request)
+    _step(scheduler, 3.0, _ready_output(async_chunk=False))
+    assert request in scheduler.waiting
+    assert request.status == RequestStatus.WAITING
+    assert request.omni_input_ready_ts is None
+
+    request.events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0)]
+    later = scheduler._make_omni_engine_output(request, new_token_ids=[])
+
+    assert later.input_ready_ts is None
 
 
 def _init_gate_flag(**model_config_fields) -> bool:
@@ -185,18 +253,21 @@ def test_gates_stage_input_on_the_native_data_plane(role, expected):
 
 
 @pytest.mark.parametrize(
-    ("events", "ready_ts", "expected"),
+    ("events", "ready_ts", "expected", "kept"),
     [
-        pytest.param([EngineCoreEvent(EngineCoreEventType.SCHEDULED, 5.0)], 4.5, 4.5, id="with_events"),
+        # Sent with the first SCHEDULED event, then cleared.
+        pytest.param([EngineCoreEvent(EngineCoreEventType.SCHEDULED, 5.0)], 4.5, 4.5, None, id="with_scheduled"),
+        # Events without SCHEDULED send the time but keep it for SCHEDULED.
+        pytest.param([EngineCoreEvent(EngineCoreEventType.QUEUED, 4.0)], 4.5, 4.5, 4.5, id="queued_only"),
         # Decode outputs carry no events and do not resend the time.
-        pytest.param(None, 4.5, None, id="without_events"),
+        pytest.param(None, 4.5, None, 4.5, id="without_events"),
         # Stage 0 or a stage without an input gate never records one.
-        pytest.param([EngineCoreEvent(EngineCoreEventType.SCHEDULED, 5.0)], None, None, id="not_recorded"),
+        pytest.param([EngineCoreEvent(EngineCoreEventType.SCHEDULED, 5.0)], None, None, None, id="not_recorded"),
     ],
 )
-def test_engine_output_sends_input_ready_time_with_engine_core_events(events, ready_ts, expected):
+def test_engine_output_sends_input_ready_time_with_engine_core_events(events, ready_ts, expected, kept):
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
-    request = Request("r", [1], SamplingParams(max_tokens=1), pooling_params=None)
+    request = OmniRequest("r", [1], SamplingParams(max_tokens=1), pooling_params=None)
     request.events = list(events or [])
     if ready_ts is not None:
         request.omni_input_ready_ts = ready_ts
@@ -205,6 +276,7 @@ def test_engine_output_sends_input_ready_time_with_engine_core_events(events, re
 
     assert output.events == events
     assert output.input_ready_ts == expected
+    assert getattr(request, "omni_input_ready_ts", None) == kept
 
 
 def test_ar_schedule_stamps_after_the_input_gates_and_before_upstream(monkeypatch):

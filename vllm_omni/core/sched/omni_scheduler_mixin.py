@@ -483,18 +483,24 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         A downstream stage can hold a request before its input exists: the
         async-chunk prewarm submits it together with stage 0, and a
         full-payload stage waits for the connector. The input gates park such
-        a request outside the waiting queues until its input lands, so a
-        request left in a waiting queue as ``WAITING`` after the gates ran has
-        its input ready. Only the first time is kept; waits for later chunks
-        are not recorded. The time leaves with the engine-core events (see
-        ``_make_omni_engine_output``) and splits ``vllm_queued_ms``.
+        a request outside the waiting queues until its input lands, and the
+        parked requests are put back only after this call, so the loop below
+        visits only what the gates left in the waiting queues; a request left
+        there as ``WAITING`` has its input ready.
+
+        Each request is stamped once per lifetime: ``omni_input_ready_stamped``
+        stays set after ``_make_omni_engine_output`` sent the time with the
+        first ``SCHEDULED`` event and cleared it, so a request that returns to
+        ``WAITING`` later is not stamped again. Waits for later chunks are not
+        recorded. The time splits ``vllm_queued_ms``.
         """
         if not (getattr(self, "log_stats", False) and getattr(self, "_gates_stage_input", False)):
             return
         for request_queue in (self.kv_holding_waiting, self.waiting):
             for request in request_queue:
-                if request.status == RequestStatus.WAITING and getattr(request, "omni_input_ready_ts", None) is None:
+                if request.status == RequestStatus.WAITING and not getattr(request, "omni_input_ready_stamped", False):
                     request.omni_input_ready_ts = now
+                    request.omni_input_ready_stamped = True
 
     def _process_chunk_receive_failures(self) -> None:
         """Fail requests whose consumed streaming input violated its contract."""
@@ -861,6 +867,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
         events = request.take_events()
+        input_ready_ts = getattr(request, "omni_input_ready_ts", None) if events else None
+        if input_ready_ts is not None and any(event.type == EngineCoreEventType.SCHEDULED for event in events):
+            # Only the first queued interval is split: once the time went out
+            # with the first SCHEDULED event, later outputs must not resend it.
+            request.omni_input_ready_ts = None
 
         return OmniEngineCoreOutput(
             request_id=request.request_id,
@@ -874,7 +885,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             multimodal_output=multimodal_output,
             stop_reason=stop_reason,
             events=events,
-            input_ready_ts=getattr(request, "omni_input_ready_ts", None) if events else None,
+            input_ready_ts=input_ready_ts,
             prefill_stats=prefill_stats,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
