@@ -71,8 +71,8 @@ def test_input_gate_records_the_first_step_that_sees_input_ready(async_chunk):
     # Queued before its upstream input exists: the gate parks it.
     _step(scheduler, 1.0)
     _step(scheduler, 2.0)
-    assert getattr(request, "omni_input_ready_ts", None) is None
-    assert not getattr(request, "omni_input_ready_stamped", False)
+    assert request.omni_input_ready_ts is None
+    assert not request.omni_input_ready_stamped
 
     _step(scheduler, 3.0, _ready_output(async_chunk))
     assert request.status == RequestStatus.WAITING
@@ -122,8 +122,8 @@ def test_input_ready_time_needs_an_input_gate_and_stats(log_stats, gates_stage_i
 
     for request in requests:
         assert request.status == RequestStatus.WAITING
-        assert getattr(request, "omni_input_ready_ts", None) is None
-        assert not hasattr(request, "omni_input_ready_stamped")
+        assert request.omni_input_ready_ts is None
+        assert not request.omni_input_ready_stamped
         request.events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.5)]
         assert scheduler._make_omni_engine_output(request, new_token_ids=[]).input_ready_ts is None
 
@@ -140,7 +140,8 @@ def test_input_ready_time_skips_requests_not_waiting_for_admission(status):
 
     scheduler._stamp_input_ready(1.0)
 
-    assert getattr(request, "omni_input_ready_ts", None) is None
+    assert request.omni_input_ready_ts is None
+    assert not request.omni_input_ready_stamped
 
 
 def test_input_ready_time_covers_requests_holding_kv_blocks():
@@ -276,7 +277,7 @@ def test_engine_output_sends_input_ready_time_with_engine_core_events(events, re
 
     assert output.events == events
     assert output.input_ready_ts == expected
-    assert getattr(request, "omni_input_ready_ts", None) == kept
+    assert request.omni_input_ready_ts == kept
 
 
 def test_ar_schedule_stamps_after_the_input_gates_and_before_upstream(monkeypatch):

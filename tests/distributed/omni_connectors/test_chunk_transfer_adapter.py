@@ -29,6 +29,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -4044,8 +4045,8 @@ def _input_ready_scheduler(adapter) -> OmniARScheduler:
     return scheduler
 
 
-def _add_input_ready_request(scheduler: OmniARScheduler, request_id: str) -> Request:
-    request = Request(request_id, [], SamplingParams(max_tokens=1), pooling_params=None)
+def _add_input_ready_request(scheduler: OmniARScheduler, request_id: str) -> OmniRequest:
+    request = OmniRequest(request_id, [], SamplingParams(max_tokens=1), pooling_params=None)
     scheduler.requests[request_id] = request
     scheduler._enqueue_waiting_request(request)
     return request
@@ -4070,7 +4071,7 @@ def test_input_ready_time_is_the_step_that_sees_the_first_chunk(build_adapter, m
     _input_ready_step(scheduler, 1.0)
     assert request.status == RequestStatus.WAITING_FOR_CHUNK
     _input_ready_step(scheduler, 2.0)
-    assert getattr(request, "omni_input_ready_ts", None) is None
+    assert request.omni_input_ready_ts is None
 
     adapter._finished_load_reqs.add("downstream")
     _input_ready_step(scheduler, 3.0)
@@ -4090,9 +4091,9 @@ def test_active_stream_slot_wait_counts_as_input_wait(build_adapter):
     _input_ready_step(scheduler, 1.0)
     assert active.status == RequestStatus.WAITING_FOR_CHUNK
     # Without an active-stream slot the request is parked and loads nothing.
-    assert getattr(parked, "omni_input_ready_ts", None) is None
+    assert parked.omni_input_ready_ts is None
 
     adapter._finished_load_reqs.add("active")
     _input_ready_step(scheduler, 2.0)
     assert active.omni_input_ready_ts == 2.0
-    assert getattr(parked, "omni_input_ready_ts", None) is None
+    assert parked.omni_input_ready_ts is None

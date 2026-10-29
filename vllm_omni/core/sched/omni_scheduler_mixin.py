@@ -484,21 +484,27 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         async-chunk prewarm submits it together with stage 0, and a
         full-payload stage waits for the connector. The input gates park such
         a request outside the waiting queues until its input lands, and the
-        parked requests are put back only after this call, so the loop below
-        visits only what the gates left in the waiting queues; a request left
-        there as ``WAITING`` has its input ready.
+        parked requests are put back only after this call, so a request the
+        loop below finds as ``WAITING`` has its input ready.
 
         Each request is stamped once per lifetime: ``omni_input_ready_stamped``
         stays set after ``_make_omni_engine_output`` sent the time with the
         first ``SCHEDULED`` event and cleared it, so a request that returns to
         ``WAITING`` later is not stamped again. Waits for later chunks are not
         recorded. The time splits ``vllm_queued_ms``.
+
+        Cost: with ``log_stats`` off, or on a stage without an input gate, this
+        returns before the loop. Otherwise every step walks all requests the
+        gates left in ``kv_holding_waiting`` and ``waiting``, which excludes
+        the parked ones: roughly O(ready backlog) per step rather than
+        O(all waiting requests). A ready request that is not scheduled yet is
+        visited again each step; the marker only avoids rewriting its time.
         """
         if not (getattr(self, "log_stats", False) and getattr(self, "_gates_stage_input", False)):
             return
         for request_queue in (self.kv_holding_waiting, self.waiting):
             for request in request_queue:
-                if request.status == RequestStatus.WAITING and not getattr(request, "omni_input_ready_stamped", False):
+                if request.status == RequestStatus.WAITING and not request.omni_input_ready_stamped:
                     request.omni_input_ready_ts = now
                     request.omni_input_ready_stamped = True
 
@@ -867,7 +873,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
         events = request.take_events()
-        input_ready_ts = getattr(request, "omni_input_ready_ts", None) if events else None
+        input_ready_ts = request.omni_input_ready_ts if events else None
         if input_ready_ts is not None and any(event.type == EngineCoreEventType.SCHEDULED for event in events):
             # Only the first queued interval is split: once the time went out
             # with the first SCHEDULED event, later outputs must not resend it.
