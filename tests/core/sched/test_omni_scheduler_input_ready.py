@@ -33,6 +33,7 @@ def _gated_scheduler(*, async_chunk: bool, log_stats: bool = True, gates_stage_i
         stage_id=1, scheduler_max_num_seqs=2, async_chunk=async_chunk
     )
     scheduler._init_omni_connector_output_inbox()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.requests = {}
     scheduler.log_stats = log_stats
     scheduler._gates_stage_input = gates_stage_input
